@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A native macOS GUI for Colima and Docker, written in Rust on AppKit with real Liquid Glass."
+license = "MIT"
 publish = false
 
 # Not `dockerplus`: that name belongs to the command line wrapper in bin/.

@@ -17,7 +17,7 @@
   </picture>
 </p>
 
-<p align="center"><b>1.6 MB</b> app &nbsp;·&nbsp; about <b>50 MB</b> of memory &nbsp;·&nbsp; <b>0%</b> CPU when idle</p>
+<p align="center"><b>1.6 MB</b> app &nbsp;·&nbsp; about <b>50 MB</b> of memory &nbsp;·&nbsp; near <b>0%</b> CPU when idle</p>
 
 ## What it does
 
@@ -25,7 +25,8 @@
 - **Compose:** projects group in the list, fold shut, and start, stop, restart or remove as one.
 - **Logs:** live, with search. Stays responsive when a container floods them.
 - **CPU and memory:** only when you ask, and never in the background.
-- **Images, volumes, storage:** see sizes, what uses what, and remove what nothing needs.
+- **Images, volumes, storage:** pull images, see sizes and what uses what, and remove what
+  nothing needs.
 - **Colima:** start, stop, restart, and change CPUs, memory and disk.
 
 `⌘1`–`⌘5` pages · `⌘F` filter · `⌘L` logs · `⇧⌘F` find in logs · `⌘I` details · `⇧⌘M` CPU and memory · `⌘R` refresh
@@ -40,9 +41,13 @@ cd dockerplus
 scripts/install.sh
 ```
 
-This installs what is missing, builds the app into `/Applications` and adds the `dockerplus`
-command. Run it again to update. The app is ad-hoc signed, so it is meant for the Mac that
-built it.
+This installs what is missing, builds the app from source into `/Applications` and adds the
+`dockerplus` command. A full build takes about 30 seconds on an M1 Pro once Rust is in place.
+Run it again to update.
+
+There is no signed download yet. The app is ad-hoc signed, so it is meant for the Mac that
+built it. The first Colima start downloads and sets up its VM, so it takes longer than later
+ones.
 
 ## Next to Docker Desktop and OrbStack
 
@@ -86,5 +91,13 @@ scripts/bundle.sh --features devtools   # adds a socket that drives the UI in te
 `src/backend/` holds the Docker API and Colima CLI code, `src/ui/` the AppKit views.
 Brand guide: [assets/brand/rex/BRAND.md](assets/brand/rex/BRAND.md).
 
-Version 0.1, tested on macOS 27.2, Colima 0.10.3 and Docker Engine 29.5.2. Not yet supported:
-Colima profiles other than `default`, Compose up, networks, notarization.
+Version 0.1, tested on an M1 Pro MacBook Pro with macOS 27.2, Colima 0.10.3 and Docker Engine
+29.5.2, where the memory and idle CPU above were measured. Not yet supported: Colima profiles
+other than `default`, Compose up, networks, notarization.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+Docker is a trademark of Docker, Inc. DockerPlus is an independent project and is not
+affiliated with or endorsed by Docker, Inc.
