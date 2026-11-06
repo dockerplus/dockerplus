@@ -5,7 +5,7 @@ use super::controller::with_ctl;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{MainThreadOnly, define_class, msg_send};
-use objc2_app_kit::{NSMenuItem, NSMenuItemValidation};
+use objc2_app_kit::{NSMenuItem, NSMenuItemValidation, NSView};
 use objc2_foundation::{MainThreadMarker, NSObject, NSString};
 
 macro_rules! actions {
@@ -40,15 +40,18 @@ actions! {
     Pull = 15,
     Refresh = 16,
     CopyId = 17,
+    Prune = 18,
     FocusSearch = 20,
     Filter = 21,
     ShowColima = 30,
     ShowContainers = 31,
     ShowImages = 32,
     ShowVolumes = 33,
+    ShowStorage = 34,
     LogsFollow = 40,
     LogsClear = 41,
     LogsClose = 42,
+    LogsFind = 43,
     ContainerPause = 50,
     ContainerResume = 51,
     ShowDetails = 52,
@@ -57,6 +60,7 @@ actions! {
     RevealMount = 55,
     SelectProject = 56,
     RunningOnly = 57,
+    ToggleStats = 58,
 }
 
 define_class!(
@@ -74,6 +78,12 @@ define_class!(
             if let Some(action) = Action::from_tag(tag) {
                 with_ctl(|ctl| ctl.perform(action));
             }
+        }
+
+        /// The disclosure arrow on a project's header row.
+        #[unsafe(method(dpToggleRow:))]
+        fn toggle_row(&self, sender: &NSView) {
+            with_ctl(|ctl| ctl.arrow_clicked(sender));
         }
 
         /// Submenu entries carry a URL or a host path in `representedObject`.

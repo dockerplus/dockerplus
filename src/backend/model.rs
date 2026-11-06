@@ -100,11 +100,26 @@ pub struct VolumeList {
     pub volumes: Vec<Volume>,
 }
 
+/// `GET /system/df`. The summaries are the engine's own, the same numbers
+/// `docker system df` prints; shared layers make them hard to reckon from outside.
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DiskUsage {
+    pub container_usage: UsageSummary,
+    pub image_usage: UsageSummary,
+    pub volume_usage: UsageSummary,
+    pub build_cache_usage: UsageSummary,
     #[serde(deserialize_with = "null_default")]
     pub volumes: Vec<VolumeUsage>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct UsageSummary {
+    pub total_count: usize,
+    pub active_count: usize,
+    pub total_size: i64,
+    pub reclaimable: i64,
 }
 
 #[derive(Deserialize, Default)]
@@ -118,6 +133,144 @@ pub struct VolumeUsage {
 #[serde(rename_all = "PascalCase", default)]
 pub struct UsageData {
     pub size: i64,
+    pub ref_count: i64,
+}
+
+/// What can be pruned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Prune {
+    Containers,
+    Images,
+    Volumes,
+    BuildCache,
+}
+
+impl Prune {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Containers => "Containers",
+            Self::Images => "Images",
+            Self::Volumes => "Volumes",
+            Self::BuildCache => "Build cache",
+        }
+    }
+}
+
+/// One row of the Storage page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StorageLine {
+    pub kind: Prune,
+    pub items: usize,
+    pub active: usize,
+    pub size: i64,
+    pub reclaimable: i64,
+}
+
+impl DiskUsage {
+    pub fn lines(&self) -> Vec<StorageLine> {
+        let line = |kind, usage: UsageSummary| StorageLine {
+            kind,
+            items: usage.total_count,
+            active: usage.active_count,
+            size: usage.total_size,
+            reclaimable: usage.reclaimable,
+        };
+        vec![
+            line(Prune::Containers, self.container_usage),
+            line(Prune::Images, self.image_usage),
+            line(Prune::Volumes, self.volume_usage),
+            line(Prune::BuildCache, self.build_cache_usage),
+        ]
+    }
+}
+
+/// Bytes a prune really freed. Size before against size after, because the
+/// figure the engine reports can be far off: 115 MB for images that took 426 MB.
+pub fn freed_bytes(kind: Prune, before: &[StorageLine], after: &[StorageLine], reported: i64) -> i64 {
+    let size = |lines: &[StorageLine]| lines.iter().find(|line| line.kind == kind).map(|line| line.size);
+    match (size(before), size(after)) {
+        (Some(before), Some(after)) if before > after => before - after,
+        _ => reported,
+    }
+}
+
+/// `GET /containers/{id}/stats`, the fields a live reading needs.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct ContainerStats {
+    pub cpu_stats: CpuStats,
+    pub memory_stats: MemoryStats,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct CpuStats {
+    pub cpu_usage: CpuUsage,
+    pub system_cpu_usage: u64,
+    pub online_cpus: u64,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct CpuUsage {
+    pub total_usage: u64,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct MemoryStats {
+    pub usage: u64,
+    pub limit: u64,
+    pub stats: HashMap<String, u64>,
+}
+
+impl MemoryStats {
+    /// The number `docker stats` shows: page cache the kernel can drop at will
+    /// does not count as used.
+    pub fn used(&self) -> u64 {
+        let cache = self.stats.get("inactive_file").copied().unwrap_or(0);
+        self.usage.saturating_sub(cache)
+    }
+}
+
+/// CPU, memory and limit summed over some containers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StatsReading {
+    /// `None` until a container has two samples to compare.
+    pub cpu: Option<f64>,
+    pub memory: u64,
+    pub limit: u64,
+}
+
+/// Turns one-shot stats into readings. The engine reports running totals, so CPU
+/// use is the change since the previous sample of the same container.
+#[derive(Default)]
+pub struct StatsMeter {
+    last: HashMap<String, (u64, u64)>,
+}
+
+impl StatsMeter {
+    pub fn read(&mut self, samples: &[(String, ContainerStats)]) -> StatsReading {
+        let mut reading = StatsReading::default();
+        let mut seen = HashMap::new();
+        for (id, stats) in samples {
+            let cpu = &stats.cpu_stats;
+            let now = (cpu.cpu_usage.total_usage, cpu.system_cpu_usage);
+            if let Some(before) = self.last.get(id) {
+                let busy = now.0.saturating_sub(before.0) as f64;
+                let total = now.1.saturating_sub(before.1) as f64;
+                if total > 0.0 {
+                    let percent = busy / total * cpu.online_cpus.max(1) as f64 * 100.0;
+                    reading.cpu = Some(reading.cpu.unwrap_or(0.0) + percent);
+                }
+            }
+            seen.insert(id.clone(), now);
+            reading.memory += stats.memory_stats.used();
+            reading.limit = reading.limit.max(stats.memory_stats.limit);
+        }
+        self.last = seen;
+        reading
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
@@ -230,20 +383,28 @@ pub struct ColimaProfile {
 }
 
 pub fn human_size(bytes: i64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    scaled(bytes, 1000.0, ["B", "KB", "MB", "GB", "TB"])
+}
+
+/// Memory in binary units, like `docker stats` and the sizes Colima reports.
+pub fn human_memory(bytes: i64) -> String {
+    scaled(bytes, 1024.0, ["B", "KiB", "MiB", "GiB", "TiB"])
+}
+
+fn scaled(bytes: i64, step: f64, units: [&str; 5]) -> String {
     if bytes < 0 {
         return "—".into();
     }
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
-        value /= 1000.0;
+    while value >= step && unit < units.len() - 1 {
+        value /= step;
         unit += 1;
     }
     match unit {
         0 => format!("{bytes} B"),
-        _ if value >= 100.0 => format!("{value:.0} {}", UNITS[unit]),
-        _ => format!("{value:.1} {}", UNITS[unit]),
+        _ if value >= 100.0 => format!("{value:.0} {}", units[unit]),
+        _ => format!("{value:.1} {}", units[unit]),
     }
 }
 
@@ -362,6 +523,57 @@ mod tests {
     }
 
     #[test]
+    fn storage_reads_the_engine_summaries() {
+        let json = r#"{"ImageUsage":{"ActiveCount":1,"Reclaimable":414,"TotalCount":3,"TotalSize":440,"Items":[]},
+            "ContainerUsage":{"TotalCount":2,"TotalSize":8},
+            "VolumeUsage":{},
+            "BuildCacheUsage":{"Reclaimable":1,"TotalCount":4,"TotalSize":7},
+            "Volumes":null}"#;
+        let usage: DiskUsage = serde_json::from_str(json).unwrap();
+        let lines = usage.lines();
+        assert_eq!((lines[1].items, lines[1].active, lines[1].size, lines[1].reclaimable), (3, 1, 440, 414));
+        assert_eq!((lines[0].items, lines[0].active, lines[0].size), (2, 0, 8));
+        assert_eq!(lines[2].items, 0);
+        assert_eq!(lines[3].size, 7);
+    }
+
+    #[test]
+    fn freed_space_is_measured_not_taken_from_the_report() {
+        let line = |size| StorageLine { kind: Prune::Images, items: 1, active: 0, size, reclaimable: 0 };
+        assert_eq!(freed_bytes(Prune::Images, &[line(440)], &[line(14)], 115), 426);
+        assert_eq!(freed_bytes(Prune::Images, &[line(440)], &[line(440)], 7), 7);
+        assert_eq!(freed_bytes(Prune::Images, &[], &[line(14)], 7), 7);
+    }
+
+    fn stats(busy: u64, system: u64, used: u64) -> ContainerStats {
+        ContainerStats {
+            cpu_stats: CpuStats { cpu_usage: CpuUsage { total_usage: busy }, system_cpu_usage: system, online_cpus: 2 },
+            memory_stats: MemoryStats {
+                usage: used + 50,
+                limit: 2_000,
+                stats: HashMap::from([("inactive_file".to_string(), 50)]),
+            },
+        }
+    }
+
+    #[test]
+    fn cpu_needs_two_samples_and_scales_by_core() {
+        let mut meter = StatsMeter::default();
+        let first = meter.read(&[("a".into(), stats(100, 1_000, 300))]);
+        assert_eq!((first.cpu, first.memory, first.limit), (None, 300, 2_000));
+        let second = meter.read(&[("a".into(), stats(150, 2_000, 300))]);
+        assert_eq!(second.cpu, Some(10.0));
+    }
+
+    #[test]
+    fn readings_add_up_across_containers() {
+        let mut meter = StatsMeter::default();
+        meter.read(&[("a".into(), stats(0, 0, 1)), ("b".into(), stats(0, 0, 2))]);
+        let both = meter.read(&[("a".into(), stats(10, 100, 1)), ("b".into(), stats(5, 100, 2))]);
+        assert_eq!((both.cpu, both.memory), (Some(30.0), 3));
+    }
+
+    #[test]
     fn sizes() {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1_500), "1.5 KB");
@@ -369,6 +581,8 @@ mod tests {
         assert_eq!(human_size(-1), "—");
         assert_eq!(human_gib(2_147_483_648), "2 GiB");
         assert_eq!(human_gib(107_374_182_400), "100 GiB");
+        assert_eq!(human_memory(120_000_000), "114 MiB");
+        assert_eq!(human_memory(1 << 30), "1.0 GiB");
     }
 
     #[test]

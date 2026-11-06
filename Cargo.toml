@@ -6,6 +6,11 @@ rust-version = "1.85"
 description = "A native macOS GUI for Colima and Docker, written in Rust on AppKit with real Liquid Glass."
 publish = false
 
+# Not `dockerplus`: that name belongs to the command line wrapper in bin/.
+[[bin]]
+name = "dockerplus-app"
+path = "src/main.rs"
+
 [features]
 # Dev-only control socket used to drive the real UI in automated checks.
 # Never enabled in the default build.

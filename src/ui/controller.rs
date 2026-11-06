@@ -10,8 +10,8 @@ use super::sidebar::{Sidebar, StatusView};
 use super::table::{Table, filter_rows};
 use super::toolbar::Toolbar;
 use super::util::*;
-use crate::backend::colima::{Colima, ColimaInfo, ResourceChange, Resources, find_tool};
-use crate::backend::docker::{ContainerAction, DResult, Docker, Scope, Snapshot, exec_script};
+use crate::backend::colima::{Colima, ColimaInfo, ResourceChange, Resources, disk_on_mac, find_tool};
+use crate::backend::docker::{ContainerAction, DResult, Docker, Scope, Snapshot, compose, exec_script};
 use crate::backend::http::Cancel;
 use crate::backend::model::*;
 use block2::RcBlock;
@@ -22,15 +22,16 @@ use objc2::sel;
 use objc2_app_kit::*;
 use objc2_foundation::*;
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROFILE: &str = "default";
 const LOG_TAIL: u32 = 1000;
@@ -48,9 +49,20 @@ const LOG_JUMP_TAIL: u32 = 200;
 const LOG_JUMP_NOTE: &str = "\n--- too much output to show it all: skipped ahead to the latest lines ---\n\n";
 /// Coalesces bursts of engine events, such as a `compose up`, into one refresh.
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(120);
+/// How soon to fetch a list again after the engine failed to give it.
+const REFRESH_RETRY: Duration = Duration::from_secs(2);
 /// Keeps "Up 3 minutes" and relative dates from going stale without any events.
 const TICK: Duration = Duration::from_secs(30);
 const ENGINE_RETRY: Duration = Duration::from_secs(2);
+/// How often to sample, and only while a sampler is running at all. Each VM
+/// reading starts a chain of processes through `colima ssh`.
+const STATS_PERIOD: Duration = Duration::from_secs(2);
+const VM_MEMORY_PERIOD: Duration = Duration::from_secs(30);
+/// Between stats passes the sampler rests this many times as long as the pass
+/// took, so measuring stays a small share of the engine's time at any scale.
+const STATS_REST_RATIO: u32 = 20;
+/// How quickly a resting sampler notices it should stop or measure something else.
+const SAMPLER_WAKE: Duration = Duration::from_millis(250);
 /// How often to re-ask Colima while it says "running" but Docker is silent.
 const COLIMA_RECHECK: Duration = Duration::from_secs(3);
 
@@ -58,7 +70,7 @@ pub enum Msg {
     Colima(Box<ColimaInfo>),
     Engine(bool),
     Changed(Scope),
-    Snapshot(DResult<Snapshot>),
+    Snapshot(Snapshot),
     Version(Option<EngineVersion>),
     VolumeSizes(HashMap<String, i64>),
     CliLine(String),
@@ -68,6 +80,10 @@ pub enum Msg {
     PullDone(Result<(), String>),
     LogEnded(u64, Option<String>),
     Details(DResult<Box<ContainerDetails>>),
+    Storage(DResult<Vec<StorageLine>>, Option<u64>),
+    Pruned(DResult<i64>),
+    Stats(StatsReading),
+    VmMemory(u64, u64),
 }
 
 thread_local! {
@@ -91,6 +107,14 @@ pub fn post(msg: Msg) {
 fn after_main(delay: Duration, body: impl FnOnce() + Send + 'static) {
     let when = DispatchTime::try_from(delay).expect("short delay");
     DispatchQueue::main().after(when, body).expect("queue accepts work");
+}
+
+/// Waits out `period`, unless `done` says there is no need to.
+fn rest(period: Duration, done: impl Fn() -> bool) {
+    let end = Instant::now() + period;
+    while Instant::now() < end && !done() {
+        thread::sleep(SAMPLER_WAKE);
+    }
 }
 
 fn now() -> i64 {
@@ -118,6 +142,21 @@ pub enum Phase {
     Running,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SampleKind {
+    /// CPU and memory of the selected containers.
+    Containers,
+    /// Memory in use inside the VM.
+    Vm,
+}
+
+/// At most one of these runs, and only while its numbers are on screen.
+struct Sampler {
+    kind: SampleKind,
+    stop: Arc<AtomicBool>,
+    targets: Arc<Mutex<Vec<String>>>,
+}
+
 struct LogSession {
     generation: u64,
     container: String,
@@ -141,12 +180,21 @@ pub struct State {
     /// Lists waiting to be fetched by the next refresh.
     stale: Scope,
     refresh_scheduled: bool,
+    /// The last refresh failed, so a list on screen may be out of date.
+    retrying: bool,
     recheck_scheduled: bool,
     busy_actions: usize,
     pull: Option<String>,
     logs: Option<LogSession>,
     log_generation: u64,
     pub running_only: bool,
+    /// Compose projects folded shut.
+    collapsed: HashSet<String>,
+    pub storage: Vec<StorageLine>,
+    mac_disk: Option<u64>,
+    pub stats_on: bool,
+    sampler: Option<Sampler>,
+    vm_memory: Option<(u64, u64)>,
 }
 
 pub struct Controller {
@@ -159,6 +207,7 @@ pub struct Controller {
     pub containers: Table,
     pub images: Table,
     pub volumes: Table,
+    pub storage: Table,
     pub colima_page: ColimaPage,
     pub logs: LogPanel,
     pub hud: Hud,
@@ -197,6 +246,7 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
     ]);
     let images = table(pages::IMAGE_COLUMNS, &[Some(("Copy ID", Action::CopyId)), None, Some(("Remove…", Action::Remove))]);
     let volumes = table(pages::VOLUME_COLUMNS, &[Some(("Copy Name", Action::CopyId)), None, Some(("Remove…", Action::Remove))]);
+    let storage = table(pages::STORAGE_COLUMNS, &[Some(("Remove Unused…", Action::Prune))]);
 
     let colima_page = ColimaPage::new(mtm, &actions);
     let hud = Hud::new(mtm);
@@ -204,7 +254,7 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
     let logs = LogPanel::new(mtm, &actions);
 
     let pages_view = NSView::new(mtm);
-    for view in [&*containers.scroll as &NSView, &images.scroll, &volumes.scroll, &colima_page.view] {
+    for view in [&*containers.scroll as &NSView, &images.scroll, &volumes.scroll, &storage.scroll, &colima_page.view] {
         pages_view.addSubview(view);
         pin(view, &pages_view);
     }
@@ -287,6 +337,7 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
         containers,
         images,
         volumes,
+        storage,
         colima_page,
         logs,
         hud,
@@ -347,8 +398,8 @@ impl Controller {
                 self.recheck_if_unsettled();
             }
             Msg::Engine(up) => self.engine_changed(up),
-            Msg::Changed(scope) => self.schedule_refresh(scope),
-            Msg::Snapshot(result) => self.snapshot_arrived(result),
+            Msg::Changed(scope) => self.schedule_refresh(scope, REFRESH_DEBOUNCE),
+            Msg::Snapshot(snapshot) => self.snapshot_arrived(snapshot),
             Msg::Version(version) => {
                 self.st.borrow_mut().engine = version;
                 self.render_chrome();
@@ -392,6 +443,42 @@ impl Controller {
             }
             Msg::LogEnded(generation, error) => self.log_ended(generation, error),
             Msg::Details(result) => self.details_arrived(result),
+            Msg::Storage(result, on_mac) => {
+                {
+                    let mut st = self.st.borrow_mut();
+                    if let Ok(lines) = result {
+                        st.storage = lines;
+                    }
+                    st.mac_disk = on_mac;
+                }
+                self.render();
+            }
+            Msg::Pruned(result) => {
+                {
+                    let mut st = self.st.borrow_mut();
+                    st.busy_actions = st.busy_actions.saturating_sub(1);
+                }
+                match result {
+                    Ok(bytes) => {
+                        let (title, detail) = pages::prune_result(bytes);
+                        self.show_notice(&title, &detail);
+                    }
+                    Err(error) => self.show_error("Docker refused that", &error),
+                }
+                self.refresh(Scope::ALL);
+                self.render_chrome();
+            }
+            Msg::Stats(reading) => {
+                if self.sampling(SampleKind::Containers) {
+                    self.hud.set_stats(Some(&pages::stats_text(&self.stats_label(), &reading)));
+                }
+            }
+            Msg::VmMemory(used, total) => {
+                if self.sampling(SampleKind::Vm) {
+                    self.st.borrow_mut().vm_memory = Some((used, total));
+                    self.render_status();
+                }
+            }
         }
     }
 
@@ -444,7 +531,10 @@ impl Controller {
                 st.images.clear();
                 st.volumes.clear();
                 st.sizes.clear();
+                st.storage.clear();
                 st.engine = None;
+                st.vm_memory = None;
+                st.retrying = false;
             }
         }
         if up {
@@ -466,6 +556,7 @@ impl Controller {
             self.stop_logs();
         }
         self.reload_colima();
+        self.sync_sampler();
         self.render();
     }
 
@@ -484,7 +575,7 @@ impl Controller {
         thread::spawn(move || post(Msg::Snapshot(docker.snapshot(scope))));
     }
 
-    fn schedule_refresh(&self, scope: Scope) {
+    fn schedule_refresh(&self, scope: Scope, delay: Duration) {
         {
             let mut st = self.st.borrow_mut();
             st.stale.merge(scope);
@@ -493,7 +584,7 @@ impl Controller {
             }
             st.refresh_scheduled = true;
         }
-        after_main(REFRESH_DEBOUNCE, || {
+        after_main(delay, || {
             with_ctl(|ctl| {
                 ctl.st.borrow_mut().refresh_scheduled = false;
                 ctl.refresh(Scope::default());
@@ -501,30 +592,46 @@ impl Controller {
         });
     }
 
-    fn snapshot_arrived(&self, result: DResult<Snapshot>) {
+    fn snapshot_arrived(&self, snapshot: Snapshot) {
+        let failed = snapshot.failed;
         let volumes_changed = {
             let mut st = self.st.borrow_mut();
             st.refreshing = false;
+            st.stale.merge(failed);
+            st.retrying = !failed.is_empty();
+            if let Some(containers) = snapshot.containers {
+                st.containers = containers;
+            }
+            if let Some(images) = snapshot.images {
+                st.images = images;
+            }
             let mut volumes_changed = false;
-            if let Ok(snapshot) = result {
-                if let Some(containers) = snapshot.containers {
-                    st.containers = containers;
-                }
-                if let Some(images) = snapshot.images {
-                    st.images = images;
-                }
-                if let Some(volumes) = snapshot.volumes {
-                    volumes_changed = st.volumes != volumes;
-                    st.volumes = volumes;
-                }
+            if let Some(volumes) = snapshot.volumes {
+                volumes_changed = st.volumes != volumes;
+                st.volumes = volumes;
             }
             volumes_changed
         };
         self.render();
-        self.refresh(Scope::default());
+        if failed.is_empty() {
+            self.refresh(Scope::default());
+        } else {
+            self.schedule_refresh(Scope::default(), REFRESH_RETRY);
+        }
         if volumes_changed {
             self.load_volume_sizes();
         }
+        self.load_storage();
+        self.update_stats_targets();
+    }
+
+    /// Walks the disk, so it only runs for the page that shows it.
+    fn load_storage(&self) {
+        if self.st.borrow().page != Page::Storage || !self.st.borrow().engine_up {
+            return;
+        }
+        let docker = self.docker();
+        thread::spawn(move || post(Msg::Storage(docker.disk_usage(), disk_on_mac())));
     }
 
     fn load_volume_sizes(&self) {
@@ -572,9 +679,11 @@ impl Controller {
             let query = st.filter.as_str();
             match st.page {
                 Page::Colima => (None, Vec::new()),
+                Page::Storage => (Some(&self.storage), pages::storage_rows(&st.storage)),
                 Page::Containers => {
                     let shown = st.containers.iter().filter(|c| !st.running_only || c.is_running());
-                    (Some(&self.containers), filter_rows(pages::container_rows(shown, now), query))
+                    let rows = filter_rows(pages::container_rows(shown, now), query);
+                    (Some(&self.containers), pages::group_by_project(rows, &st.containers, &st.collapsed))
                 }
                 Page::Images => {
                     (Some(&self.images), filter_rows(pages::image_rows(&st.images, &st.containers, now), query))
@@ -626,7 +735,8 @@ impl Controller {
             Phase::Stopped if !info.provisioned => "No virtual machine yet. The first start downloads one.".to_string(),
             _ => format!("Profile “{PROFILE}”{}", if version.is_empty() { String::new() } else { format!(" · {version}") }),
         };
-        self.colima_page.update(&info, st.engine.as_ref(), &headline, title);
+        let memory_in_use = st.vm_memory.map(|(used, total)| pages::vm_memory_text(used, total));
+        self.colima_page.update(&info, st.engine.as_ref(), memory_in_use, &headline, title);
 
         let idle = st.op.is_none();
         let installed = self.colima.is_some();
@@ -655,6 +765,7 @@ impl Controller {
         self.containers.scroll.setHidden(page != Page::Containers || !up);
         self.images.scroll.setHidden(page != Page::Images || !up);
         self.volumes.scroll.setHidden(page != Page::Volumes || !up);
+        self.storage.scroll.setHidden(page != Page::Storage || !up);
         self.empty.view.setHidden(page == Page::Colima || up);
         self.hud.view.setHidden(page == Page::Colima || !up);
 
@@ -663,6 +774,7 @@ impl Controller {
             Page::Containers => pages::containers_summary(&st.containers),
             Page::Images => pages::images_summary(&st.images),
             Page::Volumes => pages::volumes_summary(&st.volumes),
+            Page::Storage => pages::storage_summary(&st.storage, st.mac_disk),
         };
         self.window.setTitle(&ns(page.title()));
         self.window.setSubtitle(&ns(if up { &summary } else { "" }));
@@ -671,6 +783,7 @@ impl Controller {
         let activity = st.pull.as_ref().map(|text| format!("Pull: {text}")).or_else(|| {
             (st.busy_actions > 0).then(|| "Working…".to_string())
         });
+        let activity = activity.or_else(|| st.retrying.then(|| "Could not refresh, retrying…".to_string()));
         self.hud.set_activity(activity.as_deref());
     }
 
@@ -688,6 +801,8 @@ impl Controller {
             Action::Pull,
             Action::Remove,
             Action::RunningOnly,
+            Action::ToggleStats,
+            Action::Prune,
             Action::Refresh,
         ] {
             let visible = match action {
@@ -695,33 +810,34 @@ impl Controller {
                 | Action::ContainerStop
                 | Action::ContainerRestart
                 | Action::ShowLogs
-                | Action::RunningOnly => containers,
+                | Action::RunningOnly
+                | Action::ToggleStats => containers,
                 Action::Pull => page == Page::Images,
-                Action::Remove => page != Page::Colima,
+                Action::Prune => page == Page::Storage,
+                Action::Remove => matches!(page, Page::Containers | Page::Images | Page::Volumes),
                 _ => true,
             };
             self.toolbar.set(action, visible && up, self.can(action));
         }
-        self.toolbar.set_search_visible(page != Page::Colima && up);
+        self.toolbar.set_search_visible(matches!(page, Page::Containers | Page::Images | Page::Volumes) && up);
     }
 
     /// Whether an action applies right now. Drives both toolbar and menus.
     pub fn can(&self, action: Action) -> bool {
         let phase = self.phase();
         let st = self.st.borrow();
-        let selected: Vec<&Container> = self
-            .containers
-            .selected_keys()
-            .iter()
-            .filter_map(|key| st.containers.iter().find(|c| c.id == *key))
-            .collect();
+        let ids = self.selected_ids();
+        let selected: Vec<&Container> = ids.iter().filter_map(|key| st.containers.iter().find(|c| c.id == *key)).collect();
         match action {
             Action::ColimaStart => phase == Phase::Stopped,
             Action::ColimaStop | Action::ColimaRestart => matches!(phase, Phase::Running | Phase::NoEngine),
             Action::ContainerStart => selected.iter().any(|c| !c.is_running()),
             Action::ContainerStop => selected.iter().any(|c| c.is_running()),
             Action::ContainerRestart => !selected.is_empty(),
-            Action::ShowLogs => selected.len() == 1,
+            Action::ShowLogs => selected.len() == 1 && self.selected_projects().is_empty(),
+            Action::Prune => self.selected_storage_line().is_some_and(|l| l.reclaimable > 0 || l.items > l.active),
+            Action::ToggleStats => st.engine_up,
+            Action::LogsFind => !self.logs.view.isHidden(),
             // Not while half-started: the sizes Colima reports then are unreliable.
             Action::ColimaResources => self.colima.is_some() && matches!(phase, Phase::Stopped | Phase::Running),
             Action::ContainerPause => selected.iter().any(|c| c.state == "running"),
@@ -734,7 +850,7 @@ impl Controller {
             Action::RunningOnly => st.engine_up,
             Action::Pull | Action::Refresh => st.engine_up,
             Action::Remove | Action::CopyId => match st.page {
-                Page::Colima => false,
+                Page::Colima | Page::Storage => false,
                 Page::Containers => !selected.is_empty(),
                 _ => !self.current_table().is_some_and(|t| t.selected_keys().is_empty()),
             },
@@ -744,11 +860,42 @@ impl Controller {
 
     fn current_table(&self) -> Option<&Table> {
         match self.st.borrow().page {
-            Page::Colima => None,
+            Page::Colima | Page::Storage => None,
             Page::Containers => Some(&self.containers),
             Page::Images => Some(&self.images),
             Page::Volumes => Some(&self.volumes),
         }
+    }
+
+    /// The containers the selection stands for: a project header means all of
+    /// its containers, including any folded away or hidden by a filter.
+    fn selected_ids(&self) -> Vec<String> {
+        let st = self.st.borrow();
+        let mut ids = Vec::new();
+        for key in self.containers.selected_keys() {
+            match pages::project_of_key(&key) {
+                Some(project) => {
+                    ids.extend(st.containers.iter().filter(|c| c.project() == project).map(|c| c.id.clone()));
+                }
+                None => ids.push(key),
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// The projects selected, when nothing but project headers is.
+    fn selected_projects(&self) -> Vec<String> {
+        let keys = self.containers.selected_keys();
+        let projects: Vec<String> = keys.iter().filter_map(|key| pages::project_of_key(key)).map(String::from).collect();
+        if projects.len() == keys.len() { projects } else { Vec::new() }
+    }
+
+    fn selected_storage_line(&self) -> Option<StorageLine> {
+        let keys = self.storage.selected_keys();
+        let [key] = keys.as_slice() else { return None };
+        self.st.borrow().storage.iter().find(|line| line.kind.title() == key).copied()
     }
 
     // User input
@@ -760,18 +907,39 @@ impl Controller {
         if page == Page::Volumes {
             self.load_volume_sizes();
         }
+        self.load_storage();
+        self.sync_sampler();
         self.render();
+    }
+
+    /// Folds the project whose disclosure arrow this is.
+    pub fn arrow_clicked(&self, arrow: &NSView) {
+        let key = self.containers.key_of_row_holding(arrow);
+        if let Some(project) = key.as_deref().and_then(pages::project_of_key) {
+            self.toggle_project(project);
+        }
+    }
+
+    fn toggle_project(&self, project: &str) {
+        {
+            let mut st = self.st.borrow_mut();
+            if !st.collapsed.remove(project) {
+                st.collapsed.insert(project.to_string());
+            }
+        }
+        self.render_tables();
     }
 
     pub fn selection_changed(&self) {
         self.render_toolbar();
+        self.update_stats_targets();
         // With the panel open, the logs follow the selection.
         let target = {
             let st = self.st.borrow();
             if st.page != Page::Containers || st.logs.is_none() {
                 return;
             }
-            let keys = self.containers.selected_keys();
+            let keys = self.selected_ids();
             match keys.as_slice() {
                 [only] if st.logs.as_ref().is_none_or(|s| s.container != *only) => Some(only.clone()),
                 _ => None,
@@ -793,7 +961,11 @@ impl Controller {
             Action::Remove => self.confirm_remove(),
             Action::ShowLogs => {
                 if self.st.borrow().page == Page::Containers {
-                    if let [id] = self.containers.selected_keys().as_slice() {
+                    // Double-clicking a project folds it; the Logs button stays
+                    // disabled for one, so only that path gets here.
+                    if let [project] = self.selected_projects().as_slice() {
+                        self.toggle_project(project);
+                    } else if let [id] = self.selected_ids().as_slice() {
                         self.open_logs(id);
                     }
                 }
@@ -803,6 +975,7 @@ impl Controller {
                 self.refresh(Scope::ALL);
                 self.reload_colima();
                 self.load_volume_sizes();
+                self.load_storage();
             }
             Action::CopyId => self.copy_selection(),
             Action::FocusSearch => self.toolbar.focus_search(),
@@ -814,6 +987,14 @@ impl Controller {
             Action::ShowContainers => self.sidebar.select(Page::Containers),
             Action::ShowImages => self.sidebar.select(Page::Images),
             Action::ShowVolumes => self.sidebar.select(Page::Volumes),
+            Action::ShowStorage => self.sidebar.select(Page::Storage),
+            Action::Prune => self.ask_prune(),
+            Action::LogsFind => {
+                if !self.logs.view.isHidden() {
+                    self.logs.show_find(&self.window, self.mtm);
+                }
+            }
+            Action::ToggleStats => self.toggle_stats(),
             Action::LogsFollow => self.logs.toggle_follow(),
             Action::LogsClear => self.logs.clear(),
             Action::LogsClose => self.close_logs(),
@@ -938,7 +1119,17 @@ impl Controller {
     // Containers, images and volumes
 
     fn container_action(&self, action: ContainerAction) {
-        let keys = self.containers.selected_keys();
+        let verb = match action {
+            ContainerAction::Start => Some("start"),
+            ContainerAction::Stop => Some("stop"),
+            ContainerAction::Restart => Some("restart"),
+            ContainerAction::Pause | ContainerAction::Unpause => None,
+        };
+        let projects = self.selected_projects();
+        if let (Some(verb), false) = (verb, projects.is_empty()) {
+            return self.compose_action(projects, verb);
+        }
+        let keys = self.selected_ids();
         let targets: Vec<String> = {
             let st = self.st.borrow();
             let applies = |c: &Container| match action {
@@ -960,6 +1151,14 @@ impl Controller {
         });
     }
 
+    /// Acts on whole projects through `docker compose`, which knows the order
+    /// their services depend on.
+    fn compose_action(&self, projects: Vec<String>, verb: &'static str) {
+        self.run_docker(move |docker| {
+            projects.iter().find_map(|project| compose(docker.socket(), project, &[verb]).err())
+        });
+    }
+
     /// Runs engine work off the main thread, tracked by the activity capsule.
     fn run_docker(&self, work: impl FnOnce(&Docker) -> Option<String> + Send + 'static) {
         self.st.borrow_mut().busy_actions += 1;
@@ -970,8 +1169,21 @@ impl Controller {
 
     fn confirm_remove(&self) {
         let page = self.st.borrow().page;
+        let projects = self.selected_projects();
+        if page == Page::Containers && !projects.is_empty() {
+            let count = self.selected_ids().len();
+            let title = match projects.as_slice() {
+                [project] => format!("Remove project “{project}”?"),
+                _ => format!("Remove {} projects?", projects.len()),
+            };
+            let detail = format!(
+                "{count} {} and the project's networks go. Volumes and images stay.",
+                pages::plural(count, "container")
+            );
+            return self.confirm(&title, &detail, "Remove", move |ctl| ctl.compose_action(projects, "down"));
+        }
         let Some(table) = self.current_table() else { return };
-        let keys = table.selected_keys();
+        let keys = if page == Page::Containers { self.selected_ids() } else { table.selected_keys() };
         if keys.is_empty() {
             return;
         }
@@ -1024,6 +1236,26 @@ impl Controller {
         });
     }
 
+    fn ask_prune(&self) {
+        let Some(line) = self.selected_storage_line() else { return };
+        let (title, detail) = pages::prune_prompt(&line);
+        self.confirm(&title, &detail, "Remove", move |ctl| ctl.prune(line.kind));
+    }
+
+    fn prune(&self, kind: Prune) {
+        self.st.borrow_mut().busy_actions += 1;
+        self.render_chrome();
+        let docker = self.docker();
+        thread::spawn(move || {
+            let before = docker.disk_usage().unwrap_or_default();
+            let result = docker.prune(kind).map(|reported| {
+                let after = docker.disk_usage().unwrap_or_default();
+                freed_bytes(kind, &before, &after, reported)
+            });
+            post(Msg::Pruned(result));
+        });
+    }
+
     fn ask_pull(&self) {
         let field = NSTextField::initWithFrame(
             NSTextField::alloc(self.mtm),
@@ -1059,33 +1291,136 @@ impl Controller {
     }
 
     fn copy_selection(&self) {
-        let Some(keys) = self.current_table().map(Table::selected_keys) else { return };
+        let keys = if self.st.borrow().page == Page::Containers {
+            self.selected_ids()
+        } else {
+            let Some(keys) = self.current_table().map(Table::selected_keys) else { return };
+            keys
+        };
         let board = NSPasteboard::generalPasteboard();
         board.clearContents();
         board.setString_forType(&ns(&keys.join("\n")), unsafe { NSPasteboardTypeString });
     }
 
-    /// Selects every container in the Compose projects of the selected ones, so
-    /// the usual actions apply to the whole project. Filters are cleared when
-    /// they hide part of it, or Remove would quietly miss those containers.
+    /// Selects the project's header, which stands for all of its containers
+    /// whatever the filters hide.
     fn select_project(&self) {
         let keys: Vec<String> = {
             let st = self.st.borrow();
-            let selected = self.containers.selected_keys();
-            let projects: Vec<&str> = st
-                .containers
+            let selected = self.selected_ids();
+            st.containers
                 .iter()
                 .filter(|c| selected.contains(&c.id) && !c.project().is_empty())
-                .map(Container::project)
-                .collect();
-            st.containers.iter().filter(|c| projects.contains(&c.project())).map(|c| c.id.clone()).collect()
+                .map(|c| pages::project_key(c.project()))
+                .collect()
         };
-        if self.containers.select_keys(&keys) < keys.len() {
-            self.st.borrow_mut().filter.clear();
-            self.toolbar.set_search_text("");
-            self.set_running_only(false);
-            self.render();
-            self.containers.select_keys(&keys);
+        self.containers.select_keys(&keys);
+    }
+
+    // Sampling: nothing runs unless its numbers are on screen.
+
+    fn toggle_stats(&self) {
+        let on = !self.st.borrow().stats_on;
+        self.st.borrow_mut().stats_on = on;
+        let (icon, tip) = if on {
+            ("chart.bar.fill", "Showing CPU and memory")
+        } else {
+            ("chart.bar", "Show CPU and memory")
+        };
+        self.toolbar.set_icon(Action::ToggleStats, icon, tip);
+        self.sync_sampler();
+    }
+
+    /// Starts or stops the one sampler to match what is on screen.
+    pub fn sync_sampler(&self) {
+        let active = NSApplication::sharedApplication(self.mtm).isActive();
+        let want = {
+            let st = self.st.borrow();
+            match st.page {
+                Page::Containers if st.stats_on && st.engine_up && active => Some(SampleKind::Containers),
+                Page::Colima if st.engine_up && active => Some(SampleKind::Vm),
+                _ => None,
+            }
+        };
+        if want != Some(SampleKind::Containers) {
+            self.hud.set_stats(None);
+        }
+        if self.st.borrow().sampler.as_ref().map(|sampler| sampler.kind) == want {
+            return;
+        }
+        if let Some(sampler) = self.st.borrow_mut().sampler.take() {
+            sampler.stop.store(true, Ordering::Relaxed);
+        }
+        let Some(kind) = want else { return };
+        let stop = Arc::new(AtomicBool::new(false));
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        self.st.borrow_mut().sampler = Some(Sampler { kind, stop: stop.clone(), targets: targets.clone() });
+        match kind {
+            SampleKind::Containers => {
+                self.hud.set_stats(Some("Measuring…"));
+                self.update_stats_targets();
+                let docker = self.docker();
+                thread::spawn(move || {
+                    let mut meter = StatsMeter::default();
+                    while !stop.load(Ordering::Relaxed) {
+                        let ids = targets.lock().unwrap().clone();
+                        let started = Instant::now();
+                        let samples: Vec<(String, ContainerStats)> =
+                            ids.iter().filter_map(|id| docker.stats(id).ok().map(|stats| (id.clone(), stats))).collect();
+                        post(Msg::Stats(meter.read(&samples)));
+                        let pause = STATS_PERIOD.max(started.elapsed() * STATS_REST_RATIO);
+                        rest(pause, || stop.load(Ordering::Relaxed) || *targets.lock().unwrap() != ids);
+                    }
+                });
+            }
+            SampleKind::Vm => {
+                let Some(colima) = self.colima.clone() else { return };
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some((used, total)) = colima.vm_memory() {
+                            post(Msg::VmMemory(used, total));
+                        }
+                        rest(VM_MEMORY_PERIOD, || stop.load(Ordering::Relaxed));
+                    }
+                });
+            }
+        }
+    }
+
+    fn sampling(&self, kind: SampleKind) -> bool {
+        self.st.borrow().sampler.as_ref().is_some_and(|sampler| sampler.kind == kind)
+    }
+
+    /// The running containers being measured: the selected ones, or all of them
+    /// when none of the selected ones is running.
+    fn stats_targets(&self) -> Vec<String> {
+        let st = self.st.borrow();
+        let selected = self.selected_ids();
+        let running = || st.containers.iter().filter(|c| c.is_running());
+        let chosen: Vec<String> = running().filter(|c| selected.contains(&c.id)).map(|c| c.id.clone()).collect();
+        if chosen.is_empty() { running().map(|c| c.id.clone()).collect() } else { chosen }
+    }
+
+    fn update_stats_targets(&self) {
+        if self.sampling(SampleKind::Containers) {
+            let ids = self.stats_targets();
+            if let Some(sampler) = &self.st.borrow().sampler {
+                *sampler.targets.lock().unwrap() = ids;
+            }
+        }
+    }
+
+    fn stats_label(&self) -> String {
+        if let [project] = self.selected_projects().as_slice() {
+            return project.clone();
+        }
+        let selected = self.selected_ids();
+        let st = self.st.borrow();
+        let chosen: Vec<&Container> = st.containers.iter().filter(|c| c.is_running() && selected.contains(&c.id)).collect();
+        match chosen.as_slice() {
+            [] => "All containers".to_string(),
+            [only] => only.name().to_string(),
+            many => format!("{} containers", many.len()),
         }
     }
 
@@ -1102,7 +1437,7 @@ impl Controller {
     // Details, terminal, ports and mounts: each runs only when asked for.
 
     fn show_details(&self) {
-        let id = match self.containers.selected_keys().as_slice() {
+        let id = match self.selected_ids().as_slice() {
             [id] => id.clone(),
             _ => return,
         };
@@ -1139,7 +1474,7 @@ impl Controller {
     fn open_terminal(&self) {
         let target = {
             let st = self.st.borrow();
-            match self.containers.selected_keys().as_slice() {
+            match self.selected_ids().as_slice() {
                 [id] => st.containers.iter().find(|c| c.id == *id && c.state == "running").map(|c| c.id.clone()),
                 _ => None,
             }
@@ -1170,7 +1505,7 @@ impl Controller {
         }
         let (links, folders) = {
             let st = self.st.borrow();
-            match self.containers.selected_keys().as_slice() {
+            match self.selected_ids().as_slice() {
                 [id] => st
                     .containers
                     .iter()
@@ -1313,7 +1648,10 @@ impl Controller {
         let alert = NSAlert::new(self.mtm);
         alert.setMessageText(&ns(title));
         alert.setInformativeText(&ns(detail));
-        alert.addButtonWithTitle(&ns(button)).setHasDestructiveAction(true);
+        let confirm = alert.addButtonWithTitle(&ns(button));
+        confirm.setHasDestructiveAction(true);
+        // These cannot be undone, so Return must not do it. Esc still cancels.
+        confirm.setKeyEquivalent(&ns(""));
         alert.addButtonWithTitle(&ns("Cancel"));
         let on_ok = Cell::new(Some(on_ok));
         let block = RcBlock::new(move |response: NSModalResponse| {
@@ -1346,8 +1684,16 @@ impl Controller {
     }
 
     fn show_error(&self, title: &str, detail: &str) {
+        self.show_alert(NSAlertStyle::Warning, title, detail);
+    }
+
+    fn show_notice(&self, title: &str, detail: &str) {
+        self.show_alert(NSAlertStyle::Informational, title, detail);
+    }
+
+    fn show_alert(&self, style: NSAlertStyle, title: &str, detail: &str) {
         let alert = NSAlert::new(self.mtm);
-        alert.setAlertStyle(NSAlertStyle::Warning);
+        alert.setAlertStyle(style);
         alert.setMessageText(&ns(title));
         alert.setInformativeText(&ns(detail));
         if self.window.attachedSheet().is_some() {

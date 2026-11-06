@@ -4,10 +4,12 @@
 //! never falls back to another daemon, so Docker Desktop and OrbStack containers
 //! on the same machine are out of reach by construction.
 
+use super::colima::{find_tool, search_path};
 use super::http::{self, Cancel, encode};
 use super::model::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub type DResult<T> = Result<T, String>;
@@ -82,6 +84,17 @@ pub struct Snapshot {
     pub containers: Option<Vec<Container>>,
     pub images: Option<Vec<Image>>,
     pub volumes: Option<Vec<Volume>>,
+    /// The lists that could not be fetched.
+    pub failed: Scope,
+}
+
+impl Snapshot {
+    fn keep<T>(&mut self, list: Scope, result: DResult<T>) -> Option<T> {
+        if result.is_err() {
+            self.failed.merge(list);
+        }
+        result.ok()
+    }
 }
 
 impl Docker {
@@ -115,22 +128,56 @@ impl Docker {
         self.get_json("/version")
     }
 
-    pub fn snapshot(&self, scope: Scope) -> DResult<Snapshot> {
+    /// A list that fails costs only itself: the others still arrive.
+    pub fn snapshot(&self, scope: Scope) -> Snapshot {
         #[cfg(feature = "devtools")]
         for (count, fetched) in FETCHES.iter().zip([scope.containers, scope.images, scope.volumes]) {
             count.fetch_add(fetched as usize, std::sync::atomic::Ordering::Relaxed);
         }
         let mut snapshot = Snapshot::default();
         if scope.containers {
-            snapshot.containers = Some(self.get_json("/containers/json?all=1")?);
+            snapshot.containers = snapshot.keep(Scope::CONTAINERS, self.get_json("/containers/json?all=1"));
         }
         if scope.images {
-            snapshot.images = Some(self.get_json("/images/json")?);
+            snapshot.images = snapshot.keep(Scope::IMAGES, self.get_json("/images/json"));
         }
         if scope.volumes {
-            snapshot.volumes = Some(self.get_json::<VolumeList>("/volumes")?.volumes);
+            let volumes = self.get_json::<VolumeList>("/volumes").map(|list| list.volumes);
+            snapshot.volumes = snapshot.keep(Scope::VOLUMES, volumes);
         }
-        Ok(snapshot)
+        snapshot
+    }
+
+    /// What is using the disk, and how much of it could go. The engine walks the
+    /// disk for this, so it is only asked while the Storage page is open.
+    pub fn disk_usage(&self) -> DResult<Vec<StorageLine>> {
+        Ok(self.get_json::<DiskUsage>("/system/df")?.lines())
+    }
+
+    /// Removes everything of this kind that nothing is using. Returns the bytes
+    /// the engine says it freed.
+    pub fn prune(&self, kind: Prune) -> DResult<i64> {
+        #[derive(serde::Deserialize, Default)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Report {
+            space_reclaimed: i64,
+        }
+        let path = match kind {
+            Prune::Containers => "/containers/prune".to_string(),
+            // Without these filters, images keep their tags and named volumes stay.
+            Prune::Images => format!("/images/prune?filters={}", encode(r#"{"dangling":["false"]}"#)),
+            Prune::Volumes => format!("/volumes/prune?filters={}", encode(r#"{"all":["true"]}"#)),
+            Prune::BuildCache => "/build/prune?all=1".to_string(),
+        };
+        let body = self.call("POST", &path, SLOW)?;
+        let report: Report = serde_json::from_slice(&body).map_err(|e| format!("Unexpected reply from {path}: {e}"))?;
+        Ok(report.space_reclaimed)
+    }
+
+    /// One reading, returned at once. Without `one-shot` the engine spends two
+    /// seconds taking its own second sample.
+    pub fn stats(&self, id: &str) -> DResult<ContainerStats> {
+        self.get_json(&format!("/containers/{}/stats?stream=0&one-shot=1", encode(id)))
     }
 
     /// Volume sizes need the engine to walk the disk, so they are fetched apart
@@ -280,6 +327,47 @@ fn api_error(status: u16, body: &[u8]) -> String {
     }
 }
 
+/// Runs `docker compose` on a project by name, so no compose file is needed. The
+/// CLI does the work that makes a project more than its containers: `depends_on`
+/// order and waiting for health checks. `DOCKER_HOST` binds it to Colima's socket
+/// whatever the active context is.
+pub fn compose(socket: &Path, project: &str, args: &[&str]) -> DResult<()> {
+    let Some(mut command) = compose_command(find_tool("docker"), find_tool("docker-compose")) else {
+        return Err("Project actions need Docker Compose. Install it with: brew install docker docker-compose".to_string());
+    };
+    let output = command
+        .args(["-p", project])
+        .args(args)
+        .env("DOCKER_HOST", format!("unix://{}", socket.display()))
+        .env("PATH", search_path())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Could not run Docker Compose: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&output.stderr);
+    let reason = text.lines().rfind(|line| !line.trim().is_empty()).unwrap_or("docker compose failed");
+    Err(reason.trim().to_string())
+}
+
+/// The `docker compose` plugin, or else the plain `docker-compose` binary: Docker
+/// only finds Homebrew's plugin once its config says where to look.
+fn compose_command(docker: Option<PathBuf>, standalone: Option<PathBuf>) -> Option<Command> {
+    let has_plugin = |docker: &PathBuf| {
+        let check = Command::new(docker).args(["compose", "version"]).env("PATH", search_path()).output();
+        check.is_ok_and(|output| output.status.success())
+    };
+    match docker.filter(has_plugin) {
+        Some(docker) => {
+            let mut command = Command::new(docker);
+            command.arg("compose");
+            Some(command)
+        }
+        None => standalone.map(Command::new),
+    }
+}
+
 /// A script for Terminal that opens a shell in a running container. It names
 /// the socket itself, so the CLI cannot reach another daemon through a context.
 pub fn exec_script(cli: &Path, socket: &Path, id: &str) -> String {
@@ -408,6 +496,73 @@ impl PullProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dp-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn script(path: &Path, exit: u8) -> PathBuf {
+        fs::write(path, format!("#!/bin/sh\nexit {exit}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_path_buf()
+    }
+
+    #[test]
+    fn a_failed_list_does_not_cost_the_others() {
+        let dir = scratch_dir("snapshot");
+        let sock = dir.join("d.sock");
+        let _ = fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut request = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                reader.read_line(&mut request).unwrap();
+                while reader.read_line(&mut String::new()).is_ok_and(|n| n > 2) {}
+                let (status, body) = match request.split(' ').nth(1).unwrap_or("") {
+                    "/images/json" => ("500 Oops", r#"{"message":"store is busy"}"#),
+                    "/volumes" => ("200 OK", r#"{"Volumes":[]}"#),
+                    _ => ("200 OK", "[]"),
+                };
+                let head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body.as_bytes()));
+            }
+        });
+
+        let snapshot = Docker::new(&sock).snapshot(Scope::ALL);
+        assert!(snapshot.containers.is_some());
+        assert!(snapshot.images.is_none());
+        assert!(snapshot.volumes.is_some());
+        assert_eq!(snapshot.failed, Scope::IMAGES);
+        assert!(Docker::new(&sock).snapshot(Scope::CONTAINERS).failed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compose_falls_back_to_the_plain_binary() {
+        let dir = scratch_dir("compose");
+        let working = script(&dir.join("docker-with-plugin"), 0);
+        let without = script(&dir.join("docker-without-plugin"), 1);
+        let standalone = dir.join("docker-compose");
+
+        let plugin = compose_command(Some(working.clone()), Some(standalone.clone())).unwrap();
+        assert_eq!(plugin.get_program(), working);
+        assert_eq!(plugin.get_args().collect::<Vec<_>>(), ["compose"]);
+
+        let plain = compose_command(Some(without.clone()), Some(standalone.clone())).unwrap();
+        assert_eq!(plain.get_program(), standalone);
+        assert_eq!(plain.get_args().count(), 0);
+
+        assert_eq!(compose_command(None, Some(standalone.clone())).unwrap().get_program(), standalone);
+        assert!(compose_command(Some(without), None).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn frame(stream: u8, payload: &[u8]) -> Vec<u8> {
         let mut out = vec![stream, 0, 0, 0];

@@ -13,6 +13,10 @@ use objc2_foundation::*;
 use std::cell::{Cell as StdCell, OnceCell, RefCell};
 use std::cmp::Ordering;
 
+/// The first cell of an open group's header row, shown as a disclosure arrow.
+pub const ARROW_OPEN: &str = "▾";
+pub const ARROW_CLOSED: &str = "▸";
+
 const ROW_HEIGHT: f64 = 24.0;
 const FONT_SIZE: f64 = 12.0;
 
@@ -44,6 +48,8 @@ impl Column {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tone {
     Normal,
+    /// Heavier type, for the header row of a group.
+    Strong,
     Dim,
     Green,
     Orange,
@@ -76,8 +82,21 @@ impl Cell {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
+    /// Stable identity. An empty key makes a row unselectable.
     pub key: String,
     pub cells: Vec<Cell>,
+    /// Starts a group: sorting moves rows within groups, never across them.
+    pub header: bool,
+}
+
+impl Row {
+    pub fn new(key: impl Into<String>, cells: Vec<Cell>) -> Self {
+        Self { key: key.into(), cells, header: false }
+    }
+
+    pub fn header(key: impl Into<String>, cells: Vec<Cell>) -> Self {
+        Self { key: key.into(), cells, header: true }
+    }
 }
 
 /// Keeps rows with any cell containing `query`, ignoring case.
@@ -92,14 +111,20 @@ pub fn filter_rows(rows: Vec<Row>, query: &str) -> Vec<Row> {
 }
 
 pub fn sort_rows(rows: &mut [Row], column: usize, ascending: bool) {
-    rows.sort_by(|a, b| {
-        let (a, b) = (&a.cells[column], &b.cells[column]);
-        let order = match (a.sort, b.sort) {
-            (Some(x), Some(y)) => x.cmp(&y),
-            _ => compare_text(&a.text, &b.text),
-        };
-        if ascending { order } else { order.reverse() }
-    });
+    let mut start = 0;
+    while start < rows.len() {
+        let first = start + rows[start].header as usize;
+        let end = rows[first..].iter().position(|row| row.header).map_or(rows.len(), |i| first + i);
+        rows[first..end].sort_by(|a, b| {
+            let (a, b) = (&a.cells[column], &b.cells[column]);
+            let order = match (a.sort, b.sort) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                _ => compare_text(&a.text, &b.text),
+            };
+            if ascending { order } else { order.reverse() }
+        });
+        start = end;
+    }
 }
 
 fn compare_text(a: &str, b: &str) -> Ordering {
@@ -112,6 +137,7 @@ pub struct TableIvars {
     rows: RefCell<Vec<Row>>,
     sort: StdCell<Option<(usize, bool)>>,
     table: OnceCell<Retained<NSTableView>>,
+    actions: Retained<Actions>,
 }
 
 define_class!(
@@ -153,6 +179,11 @@ define_class!(
             self.cell_for(table, column, row)
         }
 
+        #[unsafe(method(tableView:shouldSelectRow:))]
+        fn should_select(&self, _table: &NSTableView, row: NSInteger) -> bool {
+            self.selectable(row)
+        }
+
         #[unsafe(method(tableViewSelectionDidChange:))]
         fn selection_changed(&self, _notification: &NSNotification) {
             with_ctl(|ctl| ctl.selection_changed());
@@ -165,7 +196,7 @@ define_class!(
         fn menu_needs_update(&self, menu: &NSMenu) {
             let Some(table) = self.ivars().table.get() else { return };
             let clicked = table.clickedRow();
-            if clicked >= 0 && !table.isRowSelected(clicked) {
+            if clicked >= 0 && self.selectable(clicked) && !table.isRowSelected(clicked) {
                 let row = NSIndexSet::indexSetWithIndex(clicked as usize);
                 table.selectRowIndexes_byExtendingSelection(&row, false);
             }
@@ -175,20 +206,54 @@ define_class!(
 );
 
 impl TableCtl {
+    /// A group label has no key, so it never joins the selection. AppKit only
+    /// asks `shouldSelectRow` about the clicks it handles itself.
+    fn selectable(&self, row: NSInteger) -> bool {
+        self.ivars().rows.borrow().get(row as usize).is_none_or(|row| !row.key.is_empty())
+    }
+
     fn cell_for(&self, table: &NSTableView, column: Option<&NSTableColumn>, row: NSInteger) -> Option<Retained<NSView>> {
         let identifier = column?.identifier();
         let index: usize = identifier.to_string().parse().ok()?;
         let rows = self.ivars().rows.borrow();
-        let cell = rows.get(row as usize)?.cells.get(index)?;
+        let line = rows.get(row as usize)?;
+        let cell = line.cells.get(index)?;
         let spec = self.ivars().columns[index];
+        if line.header && index == 0 && !cell.text.is_empty() {
+            return Some(self.arrow(table, cell.text == ARROW_OPEN));
+        }
 
-        let view = unsafe { table.makeViewWithIdentifier_owner(&identifier, None) }
+        // Heavy cells reuse among themselves, so plain ones never inherit the font.
+        let strong = cell.tone == Tone::Strong;
+        let reuse = if strong { ns(&format!("{identifier}.strong")) } else { identifier.copy() };
+        let view = unsafe { table.makeViewWithIdentifier_owner(&reuse, None) }
             .and_then(|view| view.downcast::<NSTableCellView>().ok())
-            .unwrap_or_else(|| make_cell(&identifier, spec, self.mtm()));
+            .unwrap_or_else(|| make_cell(&reuse, spec, strong, self.mtm()));
         let field = unsafe { view.textField() }?;
         field.setStringValue(&ns(&cell.text));
         field.setTextColor(Some(&color(cell.tone)));
         Some(Retained::into_super(view))
+    }
+
+    /// A real disclosure button, because a table's own click action is not
+    /// reliable on a row that is already selected.
+    fn arrow(&self, table: &NSTableView, open: bool) -> Retained<NSView> {
+        let identifier = ns("arrow");
+        let button = unsafe { table.makeViewWithIdentifier_owner(&identifier, None) }
+            .and_then(|view| view.downcast::<NSButton>().ok())
+            .unwrap_or_else(|| {
+                let target: &Actions = &self.ivars().actions;
+                let button = unsafe {
+                    NSButton::buttonWithTitle_target_action(&ns(""), Some(target), Some(sel!(dpToggleRow:)), self.mtm())
+                };
+                button.setBezelStyle(NSBezelStyle::Disclosure);
+                button.setButtonType(NSButtonType::OnOff);
+                button.setImagePosition(NSCellImagePosition::ImageOnly);
+                button.setIdentifier(Some(&identifier));
+                button
+            });
+        button.setState(if open { NSControlStateValueOn } else { NSControlStateValueOff });
+        Retained::into_super(Retained::into_super(button))
     }
 
     fn rows_after_sort(&self) -> Vec<Row> {
@@ -212,9 +277,8 @@ impl TableCtl {
     }
 
     /// Selects the rows with these keys that are on screen, and no others.
-    /// Returns how many that was.
-    fn select(&self, keys: &[String]) -> usize {
-        let Some(table) = self.ivars().table.get() else { return 0 };
+    fn select(&self, keys: &[String]) {
+        let Some(table) = self.ivars().table.get() else { return };
         let indexes = NSMutableIndexSet::new();
         for (index, row) in self.ivars().rows.borrow().iter().enumerate() {
             if keys.contains(&row.key) {
@@ -222,7 +286,6 @@ impl TableCtl {
             }
         }
         table.selectRowIndexes_byExtendingSelection(&indexes, false);
-        indexes.count()
     }
 
     fn selected_keys(&self) -> Vec<String> {
@@ -243,7 +306,7 @@ impl TableCtl {
 
 fn color(tone: Tone) -> Retained<NSColor> {
     match tone {
-        Tone::Normal => NSColor::labelColor(),
+        Tone::Normal | Tone::Strong => NSColor::labelColor(),
         Tone::Dim => NSColor::secondaryLabelColor(),
         Tone::Green => NSColor::systemGreenColor(),
         Tone::Orange => NSColor::systemOrangeColor(),
@@ -254,7 +317,7 @@ fn color(tone: Tone) -> Retained<NSColor> {
 
 /// Cells use plain frames and autoresizing: tables build many of them, and they
 /// have no layout that needs the constraint solver.
-fn make_cell(identifier: &NSString, spec: Column, mtm: MainThreadMarker) -> Retained<NSTableCellView> {
+fn make_cell(identifier: &NSString, spec: Column, strong: bool, mtm: MainThreadMarker) -> Retained<NSTableCellView> {
     let frame = NSRect::new(NSPoint::ZERO, NSSize::new(100.0, ROW_HEIGHT));
     let cell = NSTableCellView::initWithFrame(NSTableCellView::alloc(mtm), frame);
     cell.setIdentifier(Some(identifier));
@@ -264,7 +327,9 @@ fn make_cell(identifier: &NSString, spec: Column, mtm: MainThreadMarker) -> Reta
     field.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
     field.setTranslatesAutoresizingMaskIntoConstraints(true);
     field.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-    let font = if spec.mono {
+    let font = if strong {
+        NSFont::systemFontOfSize_weight(FONT_SIZE, unsafe { NSFontWeightSemibold })
+    } else if spec.mono {
         NSFont::monospacedDigitSystemFontOfSize_weight(FONT_SIZE, unsafe { NSFontWeightRegular })
     } else {
         NSFont::systemFontOfSize(FONT_SIZE)
@@ -289,10 +354,11 @@ impl Table {
     pub fn new(
         mtm: MainThreadMarker,
         columns: &'static [Column],
-        actions: &Actions,
+        actions: &Retained<Actions>,
         menu_items: &[Option<(&str, Action)>],
     ) -> Self {
         let ctl = TableCtl::alloc(mtm).set_ivars(TableIvars {
+            actions: actions.clone(),
             columns,
             source: RefCell::default(),
             rows: RefCell::default(),
@@ -372,9 +438,15 @@ impl Table {
         self.ctl.selected_keys()
     }
 
-    /// Selects the rows with these keys that are on screen, returning how many.
-    pub fn select_keys(&self, keys: &[String]) -> usize {
-        self.ctl.select(keys)
+    /// Selects the rows with these keys that are on screen.
+    pub fn select_keys(&self, keys: &[String]) {
+        self.ctl.select(keys);
+    }
+
+    /// The key of the row a view inside the table belongs to.
+    pub fn key_of_row_holding(&self, view: &NSView) -> Option<String> {
+        let row = self.view.rowForView(view);
+        self.ctl.ivars().rows.borrow().get(row as usize).map(|row| row.key.clone())
     }
 
     #[cfg(feature = "devtools")]
@@ -386,14 +458,14 @@ impl Table {
     #[cfg(feature = "devtools")]
     pub fn index_of(&self, needle: &str) -> Option<usize> {
         let rows = self.ctl.ivars().rows.borrow();
-        rows.iter().position(|row| row.key.contains(needle) || row.cells.iter().any(|cell| cell.text == needle))
+        rows.iter().position(|row| row.key.contains(needle) || row.cells.iter().any(|cell| cell.text.trim() == needle))
     }
 
     #[cfg(feature = "devtools")]
     pub fn select_key(&self, needle: &str) -> bool {
         let rows = self.ctl.ivars().rows.borrow();
         let found = rows.iter().position(|row| {
-            row.key.contains(needle) || row.cells.iter().any(|cell| cell.text == needle)
+            row.key.contains(needle) || row.cells.iter().any(|cell| cell.text.trim() == needle)
         });
         drop(rows);
         let Some(index) = found else { return false };
@@ -413,7 +485,7 @@ mod tests {
     use super::*;
 
     fn row(key: &str, name: &str, size: i64) -> Row {
-        Row { key: key.into(), cells: vec![Cell::text(name), Cell::text(&size.to_string()).sorted_by(size)] }
+        Row::new(key, vec![Cell::text(name), Cell::text(&size.to_string()).sorted_by(size)])
     }
 
     #[test]
@@ -432,6 +504,15 @@ mod tests {
         assert_eq!(keys, ["a", "c", "b"]);
         sort_rows(&mut rows, 1, false);
         assert_eq!(rows[0].key, "b");
+    }
+
+    #[test]
+    fn sorting_stays_inside_each_group() {
+        let header = |key: &str| Row::header(key, vec![Cell::text(key), Cell::text("")]);
+        let mut rows = vec![header("b"), row("b2", "z", 0), row("b1", "a", 0), header("a"), row("a1", "m", 0), row("a2", "c", 0)];
+        sort_rows(&mut rows, 0, true);
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["b", "b1", "b2", "a", "a2", "a1"]);
     }
 
     #[test]

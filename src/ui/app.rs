@@ -36,6 +36,17 @@ define_class!(
             true
         }
 
+        // Sampling stops while the app is in the background.
+        #[unsafe(method(applicationDidBecomeActive:))]
+        fn did_become_active(&self, _notification: &NSNotification) {
+            with_ctl(|ctl| ctl.sync_sampler());
+        }
+
+        #[unsafe(method(applicationDidResignActive:))]
+        fn did_resign_active(&self, _notification: &NSNotification) {
+            with_ctl(|ctl| ctl.sync_sampler());
+        }
+
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _notification: &NSNotification) {
             #[cfg(feature = "devtools")]
@@ -111,6 +122,7 @@ fn main_menu(mtm: MainThreadMarker, actions: &Actions) -> Retained<NSMenu> {
         item(mtm, "Select All", Some(sel!(selectAll:)), "a"),
         separator(),
         action_item(mtm, actions, "Filter", Action::FocusSearch, "f"),
+        action_item(mtm, actions, "Find in Logs", Action::LogsFind, "F"),
     ]);
 
     let toggle_sidebar = item(mtm, "Toggle Sidebar", Some(sel!(toggleSidebar:)), "s");
@@ -120,8 +132,10 @@ fn main_menu(mtm: MainThreadMarker, actions: &Actions) -> Retained<NSMenu> {
         action_item(mtm, actions, "Containers", Action::ShowContainers, "2"),
         action_item(mtm, actions, "Images", Action::ShowImages, "3"),
         action_item(mtm, actions, "Volumes", Action::ShowVolumes, "4"),
+        action_item(mtm, actions, "Storage", Action::ShowStorage, "5"),
         separator(),
         action_item(mtm, actions, "Show Logs", Action::ShowLogs, "l"),
+        action_item(mtm, actions, "CPU and Memory", Action::ToggleStats, "M"),
         action_item(mtm, actions, "Show Details", Action::ShowDetails, "i"),
         action_item(mtm, actions, "Refresh", Action::Refresh, "r"),
         separator(),

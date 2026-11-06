@@ -20,13 +20,14 @@ enum Entry {
     Item(Page, &'static str),
 }
 
-const ENTRIES: [Entry; 6] = [
+const ENTRIES: [Entry; 7] = [
     Entry::Header("Colima"),
     Entry::Item(Page::Colima, "speedometer"),
     Entry::Header("Docker"),
     Entry::Item(Page::Containers, "shippingbox"),
     Entry::Item(Page::Images, "square.stack.3d.up"),
     Entry::Item(Page::Volumes, "externaldrive"),
+    Entry::Item(Page::Storage, "internaldrive"),
 ];
 
 pub struct SidebarIvars {

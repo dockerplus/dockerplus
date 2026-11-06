@@ -22,6 +22,8 @@ pub struct Hud {
     activity: Retained<NSTextField>,
     activity_capsule: Retained<NSGlassEffectView>,
     spinner: Retained<NSProgressIndicator>,
+    stats: Retained<NSTextField>,
+    stats_capsule: Retained<NSGlassEffectView>,
 }
 
 impl Hud {
@@ -36,16 +38,28 @@ impl Hud {
         let activity_capsule = glass::capsule(mtm, &padded(mtm, &[&spinner, &activity]), CAPSULE_HEIGHT / 2.0, false);
         activity_capsule.setHidden(true);
 
-        let row = hstack(mtm, 8.0, &[&summary_capsule, &activity_capsule]);
+        let stats = label(mtm, "", 12.0, unsafe { NSFontWeightRegular });
+        stats.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(12.0, unsafe { NSFontWeightRegular })));
+        let stats_capsule = glass::capsule(mtm, &padded(mtm, &[&stats]), CAPSULE_HEIGHT / 2.0, false);
+        stats_capsule.setHidden(true);
+
+        let row = hstack(mtm, 8.0, &[&summary_capsule, &stats_capsule, &activity_capsule]);
         let view = glass::container(mtm, &row, 16.0);
-        for capsule in [&summary_capsule, &activity_capsule] {
+        for capsule in [&summary_capsule, &stats_capsule, &activity_capsule] {
             activate(&[capsule.heightAnchor().constraintEqualToConstant(CAPSULE_HEIGHT)]);
         }
-        Self { view, summary, activity, activity_capsule, spinner }
+        Self { view, summary, activity, activity_capsule, spinner, stats, stats_capsule }
     }
 
     pub fn set_summary(&self, text: &str) {
         self.summary.setStringValue(&ns(text));
+    }
+
+    pub fn set_stats(&self, text: Option<&str>) {
+        self.stats_capsule.setHidden(text.is_none());
+        if let Some(text) = text {
+            self.stats.setStringValue(&ns(text));
+        }
     }
 
     pub fn set_activity(&self, text: Option<&str>) {
@@ -60,8 +74,9 @@ impl Hud {
     }
 
     #[cfg(feature = "devtools")]
-    pub fn text(&self) -> (String, String) {
-        (self.summary.stringValue().to_string(), self.activity.stringValue().to_string())
+    pub fn text(&self) -> (String, String, String) {
+        let stats = if self.stats_capsule.isHidden() { String::new() } else { self.stats.stringValue().to_string() };
+        (self.summary.stringValue().to_string(), self.activity.stringValue().to_string(), stats)
     }
 }
 

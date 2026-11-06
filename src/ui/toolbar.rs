@@ -18,7 +18,7 @@ struct Item {
     icon: &'static str,
 }
 
-const ITEMS: [Item; 8] = [
+const ITEMS: [Item; 10] = [
     Item { id: "dp.start", action: Action::ContainerStart, label: "Start", icon: "play.fill" },
     Item { id: "dp.stop", action: Action::ContainerStop, label: "Stop", icon: "stop.fill" },
     Item { id: "dp.restart", action: Action::ContainerRestart, label: "Restart", icon: "arrow.clockwise" },
@@ -26,6 +26,8 @@ const ITEMS: [Item; 8] = [
     Item { id: "dp.pull", action: Action::Pull, label: "Pull Image", icon: "arrow.down.circle" },
     Item { id: "dp.remove", action: Action::Remove, label: "Remove", icon: "trash" },
     Item { id: "dp.running", action: Action::RunningOnly, label: "Running Only", icon: "line.3.horizontal.decrease.circle" },
+    Item { id: "dp.stats", action: Action::ToggleStats, label: "CPU and Memory", icon: "chart.bar" },
+    Item { id: "dp.prune", action: Action::Prune, label: "Remove Unused", icon: "sparkles" },
     Item { id: "dp.refresh", action: Action::Refresh, label: "Refresh", icon: "arrow.trianglehead.2.clockwise" },
 ];
 
@@ -174,6 +176,7 @@ impl Toolbar {
         }
     }
 
+    #[cfg(feature = "devtools")]
     pub fn set_search_text(&self, text: &str) {
         if let Some(item) = self.ctl.ivars().search.get() {
             item.searchField().setStringValue(&ns(text));

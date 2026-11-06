@@ -28,6 +28,8 @@ impl LogPanel {
         let view = NSView::new(mtm);
         let (scroll, text) = console(mtm);
         text.setTextContainerInset(NSSize::new(8.0, 40.0));
+        text.setUsesFindBar(true);
+        text.setIncrementalSearchingEnabled(true);
         view.addSubview(&scroll);
         pin(&scroll, &view);
 
@@ -35,17 +37,19 @@ impl LogPanel {
         let follow = tool_button(mtm, actions, "arrow.down.to.line", "Follow new output", Action::LogsFollow);
         follow.setButtonType(NSButtonType::PushOnPushOff);
         follow.setState(NSControlStateValueOn);
+        let find = tool_button(mtm, actions, "magnifyingglass", "Find in logs", Action::LogsFind);
         let clear = tool_button(mtm, actions, "eraser", "Clear", Action::LogsClear);
         let close = tool_button(mtm, actions, "xmark", "Close", Action::LogsClose);
 
-        let row = hstack(mtm, 6.0, &[&title, &follow, &clear, &close]);
+        let row = hstack(mtm, 6.0, &[&title, &follow, &find, &clear, &close]);
         row.setEdgeInsets(NSEdgeInsets { top: 0.0, left: 14.0, bottom: 0.0, right: 8.0 });
         let capsule = glass::capsule(mtm, &row, 15.0, true);
         let container = glass::container(mtm, &capsule, 0.0);
         view.addSubview(&container);
         container.setTranslatesAutoresizingMaskIntoConstraints(false);
         activate(&[
-            container.topAnchor().constraintEqualToAnchor_constant(&view.topAnchor(), 8.0),
+            // At the bottom, because the find bar opens along the top.
+            container.bottomAnchor().constraintEqualToAnchor_constant(&view.bottomAnchor(), -8.0),
             container.trailingAnchor().constraintEqualToAnchor_constant(&view.trailingAnchor(), -12.0),
             capsule.heightAnchor().constraintEqualToConstant(30.0),
             view.heightAnchor().constraintGreaterThanOrEqualToConstant(120.0),
@@ -70,6 +74,18 @@ impl LogPanel {
         if self.following.get() {
             scroll_to_end(&self.text);
         }
+    }
+
+    /// Opens the find bar. Following stops first, or new lines would keep
+    /// scrolling the match away.
+    pub fn show_find(&self, window: &NSWindow, mtm: MainThreadMarker) {
+        if self.following.get() {
+            self.toggle_follow();
+        }
+        window.makeFirstResponder(Some(&self.text));
+        let sender = NSMenuItem::new(mtm);
+        sender.setTag(NSTextFinderAction::ShowFindInterface.0);
+        unsafe { self.text.performTextFinderAction(Some(&sender)) };
     }
 
     pub fn append(&self, text: &str) {

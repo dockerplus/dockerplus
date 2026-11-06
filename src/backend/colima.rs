@@ -173,6 +173,12 @@ impl Colima {
         self.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), on_line)
     }
 
+    /// Memory in use inside the VM and its total, in bytes.
+    pub fn vm_memory(&self) -> Option<(u64, u64)> {
+        let output = self.command(&["ssh", "--profile", &self.profile, "--", "free", "-b"]).output().ok()?;
+        parse_free(&String::from_utf8_lossy(&output.stdout))
+    }
+
     pub fn stop(&self, on_line: impl FnMut(String)) -> Result<(), String> {
         self.run(&["stop", "--profile", self.profile.as_str()], on_line)
     }
@@ -217,6 +223,23 @@ fn start_args(profile: &str, change: ResourceChange) -> Vec<String> {
         }
     }
     args
+}
+
+/// Bytes the VM's data disk really takes on the Mac. The file is sparse, so its
+/// length says nothing; the blocks it occupies do.
+pub fn disk_on_mac() -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let disk = colima_home().join("_lima/_disks/colima/datadisk");
+    fs::metadata(disk).ok().map(|meta| meta.blocks() * 512)
+}
+
+/// Reads `free -b`: "Mem: total used free shared buff/cache available". Used here
+/// means what is not available, since Linux fills idle memory with cache.
+fn parse_free(text: &str) -> Option<(u64, u64)> {
+    let line = text.lines().find(|line| line.starts_with("Mem:"))?;
+    let fields: Vec<u64> = line.split_whitespace().skip(1).filter_map(|field| field.parse().ok()).collect();
+    let (total, available) = (*fields.first()?, *fields.get(5)?);
+    Some((total.saturating_sub(available), total))
 }
 
 fn colima_home() -> PathBuf {
@@ -269,7 +292,7 @@ fn forward_lines(source: impl Read + Send + 'static, tx: mpsc::Sender<String>) {
 }
 
 /// The directories `colima` and its helpers are looked up in.
-fn search_path() -> OsString {
+pub fn search_path() -> OsString {
     let mut dirs: Vec<PathBuf> = EXTRA_PATHS.iter().map(PathBuf::from).collect();
     if let Some(home) = env::var_os("HOME") {
         dirs.push(PathBuf::from(home).join(".local/bin"));
@@ -413,6 +436,15 @@ mod tests {
         assert!(!is_running(None, Some(&listed("Stopped"))));
         assert!(is_running(Some(&ColimaStatus::default()), None));
         assert!(!is_running(None, None));
+    }
+
+    #[test]
+    fn memory_in_use_leaves_out_cache() {
+        let text = "               total        used        free      shared  buff/cache   available\n\
+                    Mem:      2054840320   265801728  1275277312      806912   587444224  1789038592\n\
+                    Swap:              0           0           0\n";
+        assert_eq!(parse_free(text), Some((265801728, 2054840320)));
+        assert_eq!(parse_free("nothing useful"), None);
     }
 
     #[test]

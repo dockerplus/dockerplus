@@ -150,7 +150,8 @@ mod tests {
         let known = ["play.fill", "stop.fill", "arrow.clockwise", "trash", "eraser", "xmark", "speedometer",
             "shippingbox", "externaldrive", "text.alignleft", "arrow.down.circle",
             "square.stack.3d.up", "arrow.down.to.line", "arrow.trianglehead.2.clockwise",
-            "slider.horizontal.3", "line.3.horizontal.decrease.circle", "line.3.horizontal.decrease.circle.fill"];
+            "slider.horizontal.3", "line.3.horizontal.decrease.circle", "line.3.horizontal.decrease.circle.fill",
+            "chart.bar", "chart.bar.fill", "sparkles", "magnifyingglass", "internaldrive"];
         let sources: String = std::fs::read_dir(dir)
             .unwrap()
             .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())

@@ -12,8 +12,9 @@ use objc2_app_kit::*;
 use objc2_foundation::*;
 
 const KEY_COLUMN_WIDTH: f64 = 110.0;
-const FIELDS: [&str; 9] = [
-    "Status", "CPU", "Memory", "Disk", "Runtime", "Virtual machine", "Mount", "Docker engine", "Docker socket",
+const FIELDS: [&str; 10] = [
+    "Status", "CPU", "Memory", "Memory in use", "Disk", "Runtime", "Virtual machine", "Mount", "Docker engine",
+    "Docker socket",
 ];
 
 pub struct ColimaPage {
@@ -94,7 +95,14 @@ impl ColimaPage {
         Self { view, headline, values, start, stop, restart, resources, console: console_text }
     }
 
-    pub fn update(&self, info: &ColimaInfo, engine: Option<&EngineVersion>, headline: &str, status: &str) {
+    pub fn update(
+        &self,
+        info: &ColimaInfo,
+        engine: Option<&EngineVersion>,
+        memory_in_use: Option<String>,
+        headline: &str,
+        status: &str,
+    ) {
         self.headline.setStringValue(&ns(headline));
         let profile = info.profile.as_ref();
         let live = info.status.as_ref();
@@ -109,7 +117,7 @@ impl ColimaPage {
         let docker = engine.map(|e| format!("{} (API {}, kernel {})", e.version, e.api_version, e.kernel_version));
         let socket = live.map(|s| s.docker_socket.trim_start_matches("unix://").to_string());
 
-        let entries = [Some(status.to_string()), cpu, memory, disk, runtime, vm, mount, docker, socket];
+        let entries = [Some(status.to_string()), cpu, memory, memory_in_use, disk, runtime, vm, mount, docker, socket];
         for (field, value) in self.values.iter().zip(entries) {
             let value = value.filter(|v| !v.is_empty()).unwrap_or_else(|| "—".into());
             field.setStringValue(&ns(&value));

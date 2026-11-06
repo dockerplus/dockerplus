@@ -1,0 +1,83 @@
+#!/bin/sh
+# The docker CLI, pointed at Colima's engine. Plain `docker` keeps its own
+# context, so Docker Desktop or OrbStack stay the default there.
+#
+#   dockerplus ps
+#   dockerplus compose up -d
+
+# The same path as Colima::default_socket in src/backend/colima.rs.
+socket="${COLIMA_HOME:-$HOME/.colima}/default/docker.sock"
+tool=docker
+
+refuse() {
+    echo "dockerplus: $1 would leave Colima. Use docker for that." >&2
+    exit 2
+}
+
+# By default Colima shares only the home folder with its VM, unlike Docker
+# Desktop, and a bind mount from anywhere else comes up empty without an error.
+warn_if_not_shared() {
+    case "$1" in
+        "$HOME" | "$HOME"/*) ;;
+        *)
+            if [ -e "$1" ]; then
+                echo "dockerplus: warning: $1 is outside your home folder, which Colima does not share. Bind mounts from it will be empty." >&2
+            fi
+            ;;
+    esac
+}
+
+# The first word that is not a global option is the Docker command. Options that
+# pick another engine would beat DOCKER_HOST, so they stop here.
+subcommand=
+takes_value=
+for arg in "$@"; do
+    if [ -n "$takes_value" ]; then
+        takes_value=
+        continue
+    fi
+    case "$arg" in
+        --context | --context=* | --host | --host=*) refuse "$arg" ;;
+        --config | --log-level | -l | --tlscacert | --tlscert | --tlskey) takes_value=1 ;;
+        --*) ;;
+        -*[cH]*) refuse "$arg" ;; # short options combine, as in -Dc
+        -*) ;;
+        *)
+            subcommand=$arg
+            break
+            ;;
+    esac
+done
+
+case "$subcommand" in
+    # `context use` would change what plain `docker` talks to.
+    context) refuse "context" ;;
+    compose)
+        warn_if_not_shared "$PWD"
+        # Docker only finds Homebrew's plugin once its config says where to look.
+        if ! docker compose version >/dev/null 2>&1 && command -v docker-compose >/dev/null; then
+            tool=docker-compose
+            while [ "$1" != compose ]; do shift; done
+            shift
+        fi
+        ;;
+    run | create)
+        for arg in "$@"; do
+            arg=${arg#--volume=}
+            arg=${arg#-v=}
+            case "$arg" in
+                /*:/*) warn_if_not_shared "${arg%%:*}" ;;
+            esac
+        done
+        ;;
+esac
+
+# Not fatal: `dockerplus --version` works without an engine, and for everything
+# else docker reports the failed connection itself.
+if [ ! -S "$socket" ]; then
+    echo "dockerplus: Colima is not running. Start it in DockerPlus." >&2
+fi
+
+# TLS settings meant for another engine would break the local socket.
+unset DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+DOCKER_HOST="unix://$socket" exec "$tool" "$@"

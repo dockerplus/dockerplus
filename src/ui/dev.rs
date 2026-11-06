@@ -120,6 +120,7 @@ impl Controller {
             }
             "key" => self.dev_key(argument),
             "clickrow" => self.dev_click_row(argument),
+            "clickarrow" => self.dev_click_arrow(argument),
             "clicksidebar" => self.dev_click_sidebar(argument),
             "clickheader" => self.dev_click_header(argument),
             "clickbutton" => self.dev_click_button(argument),
@@ -215,15 +216,17 @@ impl Controller {
             Page::Containers => Some(&self.containers),
             Page::Images => Some(&self.images),
             Page::Volumes => Some(&self.volumes),
+            Page::Storage => Some(&self.storage),
         }
     }
 
     fn dev_state(&self) -> String {
         let st = self.st.borrow();
-        let (summary, activity) = self.hud.text();
+        let (summary, activity, stats) = self.hud.text();
         let mut enabled = serde_json::Map::new();
         for name in [
-            "ContainerStart", "ContainerStop", "ContainerRestart", "ShowLogs", "Pull", "Remove", "RunningOnly", "Refresh",
+            "ContainerStart", "ContainerStop", "ContainerRestart", "ShowLogs", "Pull", "Remove", "RunningOnly",
+            "ToggleStats", "Prune", "Refresh",
         ] {
             if let Some(item) = Action::from_name(name).and_then(|a| self.toolbar.item(a)) {
                 enabled.insert(name.into(), json!({"hidden": item.isHidden(), "enabled": item.isEnabled()}));
@@ -241,7 +244,8 @@ impl Controller {
             "images": st.images.len(),
             "volumes": st.volumes.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
             "selected": self.dev_table().map(Table::selected_keys),
-            "hud": {"summary": summary, "activity": activity},
+            "hud": {"summary": summary, "activity": activity, "stats": stats},
+            "stats_on": st.stats_on,
             "toolbar": enabled,
             "logs_visible": !self.logs.view.isHidden(),
             "sheet": self.window.attachedSheet().is_some(),
@@ -307,6 +311,7 @@ impl Controller {
             "containers" => Action::ShowContainers,
             "images" => Action::ShowImages,
             "volumes" => Action::ShowVolumes,
+            "storage" => Action::ShowStorage,
             _ => return "unknown page".into(),
         };
         self.perform(action);
@@ -461,6 +466,16 @@ impl Controller {
         };
         let Some(point) = self.dev_row_point(needle) else { return "no such row".into() };
         self.dev_click_at(point, count);
+        "clicked".into()
+    }
+
+    /// Clicks the first column of a row, where a project's arrow is.
+    fn dev_click_arrow(&self, needle: &str) -> String {
+        let Some(table) = self.dev_table() else { return "no table".into() };
+        let Some(index) = table.index_of(needle) else { return "no such row".into() };
+        let rect = table.view.rectOfRow(index as NSInteger);
+        let at = NSPoint::new(rect.origin.x + 10.0, rect.origin.y + rect.size.height / 2.0);
+        self.dev_click_at(table.view.convertPoint_toView(at, None), 1);
         "clicked".into()
     }
 

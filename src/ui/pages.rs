@@ -1,8 +1,8 @@
 //! Turns Docker objects into table rows. Pure data, so it needs no window.
 
-use super::table::{Cell, Column, Row, Tone};
+use super::table::{ARROW_CLOSED, ARROW_OPEN, Cell, Column, Row, Tone};
 use crate::backend::model::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Page {
@@ -11,6 +11,7 @@ pub enum Page {
     Containers,
     Images,
     Volumes,
+    Storage,
 }
 
 impl Page {
@@ -20,6 +21,7 @@ impl Page {
             Self::Containers => "Containers",
             Self::Images => "Images",
             Self::Volumes => "Volumes",
+            Self::Storage => "Storage",
         }
     }
 
@@ -36,8 +38,7 @@ pub const CONTAINER_COLUMNS: &[Column] = &[
     Column::new("", 22.0, 22.0).fixed(),
     Column::new("Name", 180.0, 90.0),
     Column::new("Image", 190.0, 90.0),
-    Column::new("Project", 100.0, 50.0),
-    Column::new("Status", 150.0, 70.0),
+    Column::new("Status", 170.0, 70.0),
     Column::new("Ports", 150.0, 50.0).mono(),
     Column::new("Created", 96.0, 60.0),
 ];
@@ -58,6 +59,25 @@ pub const VOLUME_COLUMNS: &[Column] = &[
     Column::new("Used by", 180.0, 60.0),
     Column::new("Created", 100.0, 60.0),
 ];
+
+pub const STORAGE_COLUMNS: &[Column] = &[
+    Column::new("Type", 220.0, 120.0),
+    Column::new("Items", 90.0, 50.0),
+    Column::new("In use", 90.0, 50.0),
+    Column::new("Size", 110.0, 60.0),
+    Column::new("Can be freed", 120.0, 60.0),
+];
+
+const PROJECT_PREFIX: &str = "project:";
+
+/// The row key of a Compose project's header.
+pub fn project_key(name: &str) -> String {
+    format!("{PROJECT_PREFIX}{name}")
+}
+
+pub fn project_of_key(key: &str) -> Option<&str> {
+    key.strip_prefix(PROJECT_PREFIX)
+}
 
 fn status_dot(container: &Container) -> Cell {
     let tone = match container.state.as_str() {
@@ -84,28 +104,165 @@ fn failed_exit(container: &Container) -> bool {
 pub fn container_rows<'a>(containers: impl IntoIterator<Item = &'a Container>, now: i64) -> Vec<Row> {
     containers
         .into_iter()
-        .map(|c| Row {
-            key: c.id.clone(),
-            cells: vec![
+        .map(|c| {
+            Row::new(c.id.clone(), vec![
                 status_dot(c),
                 Cell::text(c.name()),
                 Cell::text(&c.image),
-                Cell::dim(c.project()),
                 Cell::text(&c.status),
                 Cell::dim(&ports_text(&c.ports)),
                 Cell::dim(&relative_time(now, c.created)).sorted_by(c.created),
-            ],
+            ])
         })
         .collect()
+}
+
+const NAME_COLUMN: usize = 1;
+const INDENT: &str = "    ";
+
+/// Puts container rows under a header for each Compose project, then the rest
+/// under their own. With no projects at all, the list stays as it was. Counts
+/// come from every container, so a filter cannot make a project look smaller.
+pub fn group_by_project(rows: Vec<Row>, containers: &[Container], collapsed: &HashSet<String>) -> Vec<Row> {
+    let mut projects: BTreeMap<&str, Vec<Row>> = BTreeMap::new();
+    let mut others = Vec::new();
+    for mut row in rows {
+        let project = containers.iter().find(|c| c.id == row.key).map_or("", Container::project);
+        if project.is_empty() {
+            others.push(row);
+        } else {
+            row.cells[NAME_COLUMN].text.insert_str(0, INDENT);
+            projects.entry(project).or_default().push(row);
+        }
+    }
+    if projects.is_empty() {
+        return others;
+    }
+
+    let mut grouped = Vec::new();
+    for (name, children) in projects {
+        let open = !collapsed.contains(name);
+        let members: Vec<&Container> = containers.iter().filter(|c| c.project() == name).collect();
+        grouped.push(project_header(name, &members, open));
+        if open {
+            grouped.extend(children);
+        }
+    }
+    if !others.is_empty() {
+        let blank = || Cell::dim("");
+        grouped.push(Row::header("", vec![
+            blank(),
+            Cell { text: "Other containers".to_string(), sort: None, tone: Tone::Strong },
+            blank(),
+            blank(),
+            blank(),
+            blank(),
+        ]));
+        grouped.extend(others.into_iter().map(|mut row| {
+            row.cells[NAME_COLUMN].text.insert_str(0, INDENT);
+            row
+        }));
+    }
+    grouped
+}
+
+fn project_header(name: &str, members: &[&Container], open: bool) -> Row {
+    let running = members.iter().filter(|c| c.is_running()).count();
+    // A one-shot service that finished cleanly is not a problem to flag.
+    let unwell = members.iter().any(|c| !c.is_running() && !c.status.starts_with("Exited (0)"));
+    let tone = match (running, unwell) {
+        (0, _) => Tone::Dim,
+        (_, true) => Tone::Orange,
+        (_, false) => Tone::Green,
+    };
+    let count = format!("{} {}", members.len(), plural(members.len(), "container"));
+    Row::header(project_key(name), vec![
+        Cell::dim(if open { ARROW_OPEN } else { ARROW_CLOSED }),
+        Cell { text: name.to_string(), sort: None, tone: Tone::Strong },
+        Cell::dim(&count),
+        Cell { text: format!("{running} of {} running", members.len()), sort: None, tone },
+        Cell::dim(""),
+        Cell::dim(""),
+    ])
+}
+
+pub fn storage_rows(lines: &[StorageLine]) -> Vec<Row> {
+    lines
+        .iter()
+        .map(|line| {
+            Row::new(line.kind.title(), vec![
+                Cell::text(line.kind.title()),
+                Cell::dim(&line.items.to_string()).sorted_by(line.items as i64),
+                Cell::dim(&line.active.to_string()).sorted_by(line.active as i64),
+                Cell::text(&human_size(line.size)).sorted_by(line.size),
+                Cell::text(&human_size(line.reclaimable)).sorted_by(line.reclaimable),
+            ])
+        })
+        .collect()
+}
+
+pub fn storage_summary(lines: &[StorageLine], on_mac: Option<u64>) -> String {
+    let freeable: i64 = lines.iter().map(|line| line.reclaimable).sum();
+    let mut text = format!("{} can be freed", human_size(freeable));
+    if let Some(bytes) = on_mac {
+        text.push_str(&format!(", VM disk takes {} on this Mac", human_size(bytes as i64)));
+    }
+    text
+}
+
+/// Title and details for the confirmation before pruning.
+pub fn prune_prompt(line: &StorageLine) -> (String, String) {
+    let unused = line.items.saturating_sub(line.active);
+    let size = human_size(line.reclaimable);
+    match line.kind {
+        Prune::Containers => (
+            "Remove stopped containers?".to_string(),
+            format!("{unused} stopped {}, {size}.", plural(unused, "container")),
+        ),
+        Prune::Images => (
+            "Remove unused images?".to_string(),
+            format!("{unused} {} no container uses, tagged ones included, {size}. They can be pulled again.", plural(unused, "image")),
+        ),
+        Prune::Volumes => (
+            "Remove unused volumes?".to_string(),
+            format!("{unused} {} no container uses, {size}. Their data cannot be recovered.", plural(unused, "volume")),
+        ),
+        Prune::BuildCache => (
+            "Clear the build cache?".to_string(),
+            format!("{size}. The next builds will take longer."),
+        ),
+    }
+}
+
+/// The freed space stays with the VM: its disk file on the Mac never shrinks,
+/// not even after `fstrim`. Saying "freed" alone would promise more than that.
+pub fn prune_result(bytes: i64) -> (String, String) {
+    (
+        format!("{} freed inside the VM", human_size(bytes)),
+        "New images and containers reuse this space. The VM's disk file on this Mac keeps its current size.".to_string(),
+    )
+}
+
+pub fn stats_text(label: &str, reading: &StatsReading) -> String {
+    let cpu = reading.cpu.map_or("CPU …".to_string(), |cpu| format!("CPU {cpu:.1}%"));
+    let memory = human_memory(reading.memory as i64);
+    if reading.limit == 0 {
+        return format!("{label}: {cpu}, RAM {memory}");
+    }
+    format!("{label}: {cpu}, RAM {memory} of {}", human_gib(reading.limit as i64))
+}
+
+pub fn vm_memory_text(used: u64, total: u64) -> String {
+    let percent = (used * 100).checked_div(total).unwrap_or(0);
+    format!("{} of {} ({percent}%)", human_memory(used as i64), human_gib(total as i64))
 }
 
 pub fn image_rows(images: &[Image], containers: &[Container], now: i64) -> Vec<Row> {
     let mut rows = Vec::new();
     for image in images {
         let users = containers.iter().filter(|c| c.image_id == image.id).count();
-        let row = |key: String, repository: &str, tag: &str| Row {
-            key,
-            cells: vec![
+        let row = |key: String, repository: &str, tag: &str| {
+            Row::new(key, vec![
                 Cell::text(repository),
                 Cell::text(tag),
                 Cell::dim(short_id(&image.id)),
@@ -113,7 +270,7 @@ pub fn image_rows(images: &[Image], containers: &[Container], now: i64) -> Vec<R
                 Cell::dim(&relative_time(now, image.created)).sorted_by(image.created),
                 Cell::dim(&if users == 0 { String::new() } else { users.to_string() })
                     .sorted_by(users as i64),
-            ],
+            ])
         };
         // One row per tag, like `docker images`, so removing a row drops a tag.
         if image.repo_tags.is_empty() {
@@ -144,16 +301,13 @@ pub fn volume_rows(
                 .collect();
             let size = sizes.get(&v.name).copied();
             let created = parse_rfc3339(&v.created_at).unwrap_or(0);
-            Row {
-                key: v.name.clone(),
-                cells: vec![
-                    Cell::text(&v.name),
-                    Cell::dim(&v.driver),
-                    Cell::text(&size.map_or("—".to_string(), human_size)).sorted_by(size.unwrap_or(-1)),
-                    Cell::dim(&users.join(", ")),
-                    Cell::dim(&relative_time(now, created)).sorted_by(created),
-                ],
-            }
+            Row::new(v.name.clone(), vec![
+                Cell::text(&v.name),
+                Cell::dim(&v.driver),
+                Cell::text(&size.map_or("—".to_string(), human_size)).sorted_by(size.unwrap_or(-1)),
+                Cell::dim(&users.join(", ")),
+                Cell::dim(&relative_time(now, created)).sorted_by(created),
+            ])
         })
         .collect()
 }
@@ -293,6 +447,90 @@ mod tests {
             image_id: "sha256:one".into(),
             ..Default::default()
         }
+    }
+
+    fn member(name: &str, project: &str, state: &str) -> Container {
+        let mut c = container(name, state, "");
+        if !project.is_empty() {
+            c.labels.insert("com.docker.compose.project".into(), project.into());
+        }
+        c
+    }
+
+    #[test]
+    fn containers_group_under_their_projects_then_the_rest() {
+        let all = [member("web", "shop", "running"), member("solo", "", "running"), member("db", "shop", "exited")];
+        let rows = group_by_project(container_rows(&all, 100), &all, &HashSet::new());
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["project:shop", "id-web", "id-db", "", "id-solo"]);
+        assert_eq!(rows[0].cells[3].text, "1 of 2 running");
+        assert_eq!(rows[0].cells[3].tone, Tone::Orange);
+        assert_eq!(rows[1].cells[1].text.trim(), "web");
+        assert!(rows[0].header && rows[3].header && !rows[1].header);
+    }
+
+    #[test]
+    fn a_finished_one_shot_service_is_not_a_warning() {
+        let mut init = member("init", "shop", "exited");
+        init.status = "Exited (0) 2 minutes ago".into();
+        let all = [member("web", "shop", "running"), init];
+        let rows = group_by_project(container_rows(&all, 100), &all, &HashSet::new());
+        assert_eq!(rows[0].cells[3].text, "1 of 2 running");
+        assert_eq!(rows[0].cells[3].tone, Tone::Green);
+    }
+
+    #[test]
+    fn without_projects_the_list_stays_flat() {
+        let all = [member("a", "", "running"), member("b", "", "exited")];
+        let rows = container_rows(&all, 100);
+        assert_eq!(group_by_project(rows.clone(), &all, &HashSet::new()), rows);
+    }
+
+    #[test]
+    fn a_collapsed_project_keeps_its_header_only() {
+        let all = [member("web", "shop", "running"), member("db", "shop", "running")];
+        let rows = group_by_project(container_rows(&all, 100), &all, &HashSet::from(["shop".to_string()]));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cells[0].text, "▸");
+        assert_eq!(rows[0].cells[3].tone, Tone::Green);
+    }
+
+    #[test]
+    fn a_filter_cannot_shrink_a_project_header() {
+        let all = [member("web", "shop", "running"), member("db", "shop", "exited")];
+        let rows = crate::ui::table::filter_rows(container_rows(&all, 100), "web");
+        let rows = group_by_project(rows, &all, &HashSet::new());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].cells[2].text, "2 containers");
+    }
+
+    #[test]
+    fn project_keys_round_trip() {
+        assert_eq!(project_of_key(&project_key("shop")), Some("shop"));
+        assert_eq!(project_of_key("abc123"), None);
+    }
+
+    #[test]
+    fn the_prune_result_does_not_promise_space_on_the_mac() {
+        let (title, detail) = prune_result(405_000_000);
+        assert_eq!(title, "405 MB freed inside the VM");
+        assert!(detail.contains("keeps its current size"));
+    }
+
+    #[test]
+    fn volume_prompts_warn_about_data() {
+        let line = StorageLine { kind: Prune::Volumes, items: 3, active: 1, size: 0, reclaimable: 1_000 };
+        assert!(prune_prompt(&line).1.starts_with("2 volumes"));
+        assert!(prune_prompt(&line).1.contains("cannot be recovered"));
+    }
+
+    #[test]
+    fn stats_read_clearly() {
+        let reading = StatsReading { cpu: Some(3.25), memory: 120_000_000, limit: 2 << 30 };
+        assert_eq!(stats_text("web", &reading), "web: CPU 3.2%, RAM 114 MiB of 2 GiB");
+        let first = StatsReading { cpu: None, memory: 0, limit: 0 };
+        assert_eq!(stats_text("web", &first), "web: CPU …, RAM 0 B");
+        assert_eq!(vm_memory_text(1 << 30, 2 << 30), "1.0 GiB of 2 GiB (50%)");
     }
 
     #[test]
