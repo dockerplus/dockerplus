@@ -18,13 +18,14 @@ struct Item {
     icon: &'static str,
 }
 
-const ITEMS: [Item; 7] = [
+const ITEMS: [Item; 8] = [
     Item { id: "dp.start", action: Action::ContainerStart, label: "Start", icon: "play.fill" },
     Item { id: "dp.stop", action: Action::ContainerStop, label: "Stop", icon: "stop.fill" },
     Item { id: "dp.restart", action: Action::ContainerRestart, label: "Restart", icon: "arrow.clockwise" },
     Item { id: "dp.logs", action: Action::ShowLogs, label: "Logs", icon: "text.alignleft" },
     Item { id: "dp.pull", action: Action::Pull, label: "Pull Image", icon: "arrow.down.circle" },
     Item { id: "dp.remove", action: Action::Remove, label: "Remove", icon: "trash" },
+    Item { id: "dp.running", action: Action::RunningOnly, label: "Running Only", icon: "line.3.horizontal.decrease.circle" },
     Item { id: "dp.refresh", action: Action::Refresh, label: "Refresh", icon: "arrow.trianglehead.2.clockwise" },
 ];
 
@@ -147,6 +148,13 @@ impl Toolbar {
         if let Some(item) = self.ctl.ivars().items.borrow().get(&action) {
             item.setHidden(!visible);
             item.setEnabled(enabled);
+        }
+    }
+
+    pub fn set_icon(&self, action: Action, icon: &str, tip: &str) {
+        if let Some(item) = self.ctl.ivars().items.borrow().get(&action) {
+            item.setImage(symbol(icon, tip).as_deref());
+            item.setToolTip(Some(&ns(tip)));
         }
     }
 

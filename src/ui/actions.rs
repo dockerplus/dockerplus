@@ -6,7 +6,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{NSMenuItem, NSMenuItemValidation};
-use objc2_foundation::{MainThreadMarker, NSObject};
+use objc2_foundation::{MainThreadMarker, NSObject, NSString};
 
 macro_rules! actions {
     ($($name:ident = $tag:literal),* $(,)?) => {
@@ -31,6 +31,7 @@ actions! {
     ColimaStart = 1,
     ColimaStop = 2,
     ColimaRestart = 3,
+    ColimaResources = 4,
     ContainerStart = 10,
     ContainerStop = 11,
     ContainerRestart = 12,
@@ -48,6 +49,14 @@ actions! {
     LogsFollow = 40,
     LogsClear = 41,
     LogsClose = 42,
+    ContainerPause = 50,
+    ContainerResume = 51,
+    ShowDetails = 52,
+    OpenTerminal = 53,
+    OpenPort = 54,
+    RevealMount = 55,
+    SelectProject = 56,
+    RunningOnly = 57,
 }
 
 define_class!(
@@ -64,6 +73,15 @@ define_class!(
             let tag: isize = unsafe { msg_send![sender, tag] };
             if let Some(action) = Action::from_tag(tag) {
                 with_ctl(|ctl| ctl.perform(action));
+            }
+        }
+
+        /// Submenu entries carry a URL or a host path in `representedObject`.
+        #[unsafe(method(dpOpen:))]
+        fn open(&self, sender: &NSMenuItem) {
+            let location = sender.representedObject().and_then(|object| object.downcast::<NSString>().ok());
+            if let Some(location) = location {
+                with_ctl(|ctl| ctl.open_location(&location.to_string()));
             }
         }
     }

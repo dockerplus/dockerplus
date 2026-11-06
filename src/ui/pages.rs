@@ -2,7 +2,7 @@
 
 use super::table::{Cell, Column, Row, Tone};
 use crate::backend::model::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Page {
@@ -81,9 +81,9 @@ fn failed_exit(container: &Container) -> bool {
     container.state == "exited" && !container.status.starts_with("Exited (0)")
 }
 
-pub fn container_rows(containers: &[Container], now: i64) -> Vec<Row> {
+pub fn container_rows<'a>(containers: impl IntoIterator<Item = &'a Container>, now: i64) -> Vec<Row> {
     containers
-        .iter()
+        .into_iter()
         .map(|c| Row {
             key: c.id.clone(),
             cells: vec![
@@ -176,6 +176,110 @@ pub fn plural(count: usize, noun: &str) -> String {
     if count == 1 { noun.to_string() } else { format!("{noun}s") }
 }
 
+/// Published TCP ports as menu title and URL, once each. Colima forwards them
+/// to the Mac, so a port bound on all interfaces answers on localhost.
+pub fn port_links(ports: &[Port]) -> Vec<(String, String)> {
+    let mut links: Vec<(u16, String, String)> = ports
+        .iter()
+        .filter(|p| p.kind == "tcp")
+        .filter_map(|p| {
+            let public = p.public_port?;
+            let host = match p.ip.as_str() {
+                "" | "0.0.0.0" | "::" => "localhost".to_string(),
+                ip if ip.contains(':') => format!("[{ip}]"),
+                ip => ip.to_string(),
+            };
+            let scheme = if p.private_port == 443 { "https" } else { "http" };
+            Some((public, format!("{host}:{public} → {}", p.private_port), format!("{scheme}://{host}:{public}")))
+        })
+        .collect();
+    links.sort();
+    links.dedup();
+    links.into_iter().map(|(_, title, url)| (title, url)).collect()
+}
+
+/// Bind mounts as menu title and host path.
+pub fn bind_mounts(mounts: &[Mount]) -> Vec<(String, String)> {
+    mounts
+        .iter()
+        .filter(|m| m.kind == "bind" && !m.source.is_empty())
+        .map(|m| (format!("{} → {}", m.source, m.destination), m.source.clone()))
+        .collect()
+}
+
+/// The rows of the details sheet. A row with an empty label continues the one
+/// above it.
+pub fn container_details(d: &ContainerDetails, digests: &[String], now: i64) -> Vec<(&'static str, String)> {
+    let mut lines = Vec::new();
+    let mut add = |label: &'static str, values: Vec<String>| {
+        for (i, value) in values.into_iter().filter(|v| !v.is_empty()).enumerate() {
+            lines.push((if i == 0 { label } else { "" }, value));
+        }
+    };
+    let status = match d.state.status.as_str() {
+        "exited" => format!("exited ({})", d.state.exit_code),
+        other => other.to_string(),
+    };
+    let command: Vec<&str> = std::iter::once(d.path.as_str()).chain(d.args.iter().map(String::as_str)).collect();
+    let restart = match d.host_config.restart_policy.name.as_str() {
+        "" | "no" => String::new(),
+        name => name.to_string(),
+    };
+    let project = d.config.labels.get("com.docker.compose.project").cloned().unwrap_or_default();
+
+    add("Name", vec![d.name.trim_start_matches('/').to_string()]);
+    add("ID", vec![d.id.clone()]);
+    add("Image", vec![d.config.image.clone()]);
+    add("Image ID", vec![d.image.clone()]);
+    add("Digest", digests.to_vec());
+    add("Status", vec![status]);
+    add("Created", vec![parse_rfc3339(&d.created).map_or(String::new(), |t| relative_time(now, t))]);
+    add("Command", vec![command.join(" ").trim().to_string()]);
+    add("Workdir", vec![d.config.working_dir.clone()]);
+    add("Restart", vec![restart]);
+    add("Project", vec![project]);
+    add("Ports", port_lines(&d.network_settings.ports));
+    add("Mounts", d.mounts.iter().map(mount_line).collect());
+    add(
+        "Networks",
+        d.network_settings.networks.iter().map(|(name, e)| format!("{name} {}", e.ip_address).trim_end().to_string()).collect(),
+    );
+    lines
+}
+
+fn port_lines(ports: &BTreeMap<String, Option<Vec<PortBinding>>>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (inside, bindings) in ports {
+        let mut outside: Vec<String> = bindings
+            .iter()
+            .flatten()
+            .map(|b| match b.host_ip.as_str() {
+                "" | "0.0.0.0" | "::" => b.host_port.clone(),
+                ip => format!("{ip}:{}", b.host_port),
+            })
+            .collect();
+        outside.sort();
+        outside.dedup();
+        if outside.is_empty() {
+            lines.push(inside.clone());
+        }
+        lines.extend(outside.into_iter().map(|o| format!("{o} → {inside}")));
+    }
+    lines
+}
+
+fn mount_line(m: &Mount) -> String {
+    let from = if m.kind == "volume" { &m.name } else { &m.source };
+    let mode = if m.rw { "" } else { " (read-only)" };
+    format!("{} {from} → {}{mode}", m.kind, m.destination)
+}
+
+/// Lays the rows out in two aligned columns for a monospaced view.
+pub fn details_text(lines: &[(&str, String)]) -> String {
+    let width = lines.iter().map(|(label, _)| label.chars().count()).max().unwrap_or(0) + 2;
+    lines.iter().map(|(label, value)| format!("{label:<width$}{value}")).collect::<Vec<_>>().join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,7 +326,7 @@ mod tests {
     #[test]
     fn volumes_list_the_containers_using_them() {
         let mut user = container("db", "running", "Up");
-        user.mounts = vec![Mount { kind: "volume".into(), name: "data".into() }];
+        user.mounts = vec![Mount { kind: "volume".into(), name: "data".into(), ..Default::default() }];
         let sizes = HashMap::from([("data".to_string(), 1_500_000)]);
         let volumes = [Volume { name: "data".into(), ..Default::default() }];
         let rows = volume_rows(&volumes, &[user], &sizes, 100);
@@ -234,5 +338,60 @@ mod tests {
     fn summaries_handle_singular() {
         assert_eq!(containers_summary(&[container("a", "running", "Up")]), "1 container, 1 running");
         assert_eq!(volumes_summary(&[]), "0 volumes");
+    }
+
+    #[test]
+    fn ports_open_once_each_on_localhost() {
+        let port = |ip: &str, private, public, kind: &str| Port { ip: ip.into(), private_port: private, public_port: public, kind: kind.into() };
+        let ports = [
+            port("0.0.0.0", 80, Some(18080), "tcp"),
+            port("::", 80, Some(18080), "tcp"),
+            port("127.0.0.1", 443, Some(8443), "tcp"),
+            port("", 5432, None, "tcp"),
+            port("0.0.0.0", 53, Some(5353), "udp"),
+        ];
+        assert_eq!(
+            port_links(&ports),
+            [
+                ("127.0.0.1:8443 → 443".to_string(), "https://127.0.0.1:8443".to_string()),
+                ("localhost:18080 → 80".to_string(), "http://localhost:18080".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_bind_mounts_open_in_finder() {
+        let mounts = [
+            Mount { kind: "bind".into(), source: "/Users/a/site".into(), destination: "/www".into(), ..Default::default() },
+            Mount { kind: "volume".into(), name: "data".into(), destination: "/data".into(), ..Default::default() },
+        ];
+        assert_eq!(bind_mounts(&mounts), [("/Users/a/site → /www".to_string(), "/Users/a/site".to_string())]);
+    }
+
+    #[test]
+    fn details_read_the_inspect_json() {
+        let json = r#"{"Id":"abc","Name":"/web","Created":"1970-01-01T01:00:00Z","Path":"nginx","Args":["-g","daemon off;"],
+            "Image":"sha256:img","State":{"Status":"exited","ExitCode":137},
+            "Config":{"Image":"nginx:alpine","WorkingDir":"","Labels":{"com.docker.compose.project":"demo"}},
+            "HostConfig":{"RestartPolicy":{"Name":"no"}},
+            "Mounts":[{"Type":"bind","Source":"/Users/a/site","Destination":"/www","RW":false}],
+            "NetworkSettings":{"Ports":{"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"18080"},{"HostIp":"::","HostPort":"18080"}],"443/tcp":null},
+                               "Networks":{"bridge":{"IPAddress":"172.17.0.2"}}}}"#;
+        let details: ContainerDetails = serde_json::from_str(json).unwrap();
+        let lines = container_details(&details, &["nginx@sha256:d".to_string()], 3_600 + 7_200);
+        let find = |label: &str| lines.iter().position(|(l, _)| *l == label).map(|i| lines[i].1.as_str());
+        assert_eq!(find("Name"), Some("web"));
+        assert_eq!(find("Digest"), Some("nginx@sha256:d"));
+        assert_eq!(find("Status"), Some("exited (137)"));
+        assert_eq!(find("Created"), Some("2 hours ago"));
+        assert_eq!(find("Command"), Some("nginx -g daemon off;"));
+        assert_eq!(find("Restart"), None);
+        assert_eq!(find("Project"), Some("demo"));
+        assert_eq!(find("Mounts"), Some("bind /Users/a/site → /www (read-only)"));
+        assert_eq!(find("Networks"), Some("bridge 172.17.0.2"));
+        let ports = lines.iter().position(|(l, _)| *l == "Ports").unwrap();
+        assert_eq!(lines[ports].1, "443/tcp");
+        assert_eq!(lines[ports + 1], ("", "18080 → 80/tcp".to_string()));
+        assert!(details_text(&lines).starts_with("Name      web\nID        abc"));
     }
 }

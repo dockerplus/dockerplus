@@ -48,13 +48,43 @@ pub struct ColimaInfo {
     pub profile: Option<ColimaProfile>,
 }
 
+/// VM size in whole CPUs and GiB, as `colima start` takes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Resources {
+    pub cpus: u32,
+    pub memory: u32,
+    pub disk: u32,
+}
+
+/// Offered disk sizes. Colima can grow a disk but never shrink it.
+const DISK_STEPS: [u32; 12] = [20, 40, 60, 80, 100, 150, 200, 300, 400, 500, 750, 1000];
+
+impl Resources {
+    /// Colima's own defaults, used before a VM exists.
+    pub const DEFAULT: Self = Self { cpus: 2, memory: 2, disk: 100 };
+
+    pub fn current(info: &ColimaInfo) -> Option<Self> {
+        let (cpus, memory, disk) = match (&info.status, &info.profile) {
+            (Some(s), _) => (s.cpu, s.memory, s.disk),
+            (None, Some(p)) => (p.cpus, p.memory, p.disk),
+            _ => return None,
+        };
+        let gib = |bytes: i64| (bytes as f64 / (1u64 << 30) as f64).round() as u32;
+        (cpus > 0).then(|| Self { cpus: cpus as u32, memory: gib(memory), disk: gib(disk) })
+    }
+
+    pub fn disk_choices(current: Option<u32>) -> Vec<u32> {
+        let floor = current.unwrap_or(0);
+        let mut choices: Vec<u32> = DISK_STEPS.into_iter().filter(|d| *d >= floor).chain(current).collect();
+        choices.sort_unstable();
+        choices.dedup();
+        choices
+    }
+}
+
 impl Colima {
     pub fn locate(profile: &str) -> Option<Self> {
-        let path = search_path();
-        env::split_paths(&path)
-            .map(|dir| dir.join("colima"))
-            .find(|candidate| is_executable(candidate))
-            .map(|bin| Self { bin, profile: profile.to_string() })
+        find_tool("colima").map(|bin| Self { bin, profile: profile.to_string() })
     }
 
     pub fn default_socket(profile: &str) -> PathBuf {
@@ -98,11 +128,14 @@ impl Colima {
         }
     }
 
-    pub fn start(&self, mut on_line: impl FnMut(String)) -> Result<(), String> {
+    /// Starts the VM, resizing it first when `resources` is given. Colima saves
+    /// the new size in its config, so later plain starts keep it.
+    pub fn start(&self, resources: Option<Resources>, mut on_line: impl FnMut(String)) -> Result<(), String> {
         if let Some(note) = prepare_guest_user()? {
             on_line(note);
         }
-        self.run(&start_args(&self.profile), on_line)
+        let args = start_args(&self.profile, resources);
+        self.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), on_line)
     }
 
     pub fn stop(&self, on_line: impl FnMut(String)) -> Result<(), String> {
@@ -140,8 +173,15 @@ impl Colima {
     }
 }
 
-fn start_args(profile: &str) -> [&str; 4] {
-    ["start", "--activate=false", "--profile", profile]
+fn start_args(profile: &str, resources: Option<Resources>) -> Vec<String> {
+    let mut args: Vec<String> = ["start", "--activate=false", "--profile", profile].map(String::from).into();
+    if let Some(r) = resources {
+        for (flag, value) in [("--cpus", r.cpus), ("--memory", r.memory), ("--disk", r.disk)] {
+            args.push(flag.to_string());
+            args.push(value.to_string());
+        }
+    }
+    args
 }
 
 fn colima_home() -> PathBuf {
@@ -209,6 +249,12 @@ fn search_path() -> OsString {
     env::join_paths(dirs).unwrap_or_default()
 }
 
+/// Finds a command line tool where a login shell would, even when the app was
+/// opened from Finder.
+pub fn find_tool(name: &str) -> Option<PathBuf> {
+    env::split_paths(&search_path()).map(|dir| dir.join(name)).find(|candidate| is_executable(candidate))
+}
+
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -265,7 +311,27 @@ mod tests {
 
     #[test]
     fn every_start_refuses_to_change_the_docker_context() {
-        assert!(start_args("default").contains(&"--activate=false"));
+        assert!(start_args("default", None).contains(&"--activate=false".to_string()));
+        let sized = Resources { cpus: 4, memory: 8, disk: 120 };
+        assert_eq!(
+            start_args("default", Some(sized)),
+            ["start", "--activate=false", "--profile", "default", "--cpus", "4", "--memory", "8", "--disk", "120"]
+        );
+    }
+
+    #[test]
+    fn disks_are_never_offered_smaller_than_they_are() {
+        assert_eq!(Resources::disk_choices(Some(100)), [100, 150, 200, 300, 400, 500, 750, 1000]);
+        assert_eq!(Resources::disk_choices(Some(130))[0], 130);
+        assert_eq!(Resources::disk_choices(None)[0], 20);
+    }
+
+    #[test]
+    fn current_resources_come_in_gib() {
+        let status = ColimaStatus { cpu: 2, memory: 2 << 30, disk: 100 << 30, ..Default::default() };
+        let info = ColimaInfo { status: Some(status), ..Default::default() };
+        assert_eq!(Resources::current(&info), Some(Resources { cpus: 2, memory: 2, disk: 100 }));
+        assert_eq!(Resources::current(&ColimaInfo::default()), None);
     }
 
     #[test]

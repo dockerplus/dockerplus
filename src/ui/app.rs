@@ -122,6 +122,7 @@ fn main_menu(mtm: MainThreadMarker, actions: &Actions) -> Retained<NSMenu> {
         action_item(mtm, actions, "Volumes", Action::ShowVolumes, "4"),
         separator(),
         action_item(mtm, actions, "Show Logs", Action::ShowLogs, "l"),
+        action_item(mtm, actions, "Show Details", Action::ShowDetails, "i"),
         action_item(mtm, actions, "Refresh", Action::Refresh, "r"),
         separator(),
         toggle_sidebar,

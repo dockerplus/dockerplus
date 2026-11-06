@@ -10,18 +10,23 @@ use super::sidebar::{Sidebar, StatusView};
 use super::table::{Table, filter_rows};
 use super::toolbar::Toolbar;
 use super::util::*;
-use crate::backend::colima::{Colima, ColimaInfo};
-use crate::backend::docker::{ContainerAction, DResult, Docker, Snapshot};
+use crate::backend::colima::{Colima, ColimaInfo, Resources, find_tool};
+use crate::backend::docker::{ContainerAction, DResult, Docker, Snapshot, exec_script};
 use crate::backend::http::Cancel;
 use crate::backend::model::*;
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
+use objc2::sel;
 use objc2_app_kit::*;
 use objc2_foundation::*;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -57,6 +62,7 @@ pub enum Msg {
     PullProgress(String),
     PullDone(Result<(), String>),
     LogEnded(u64, Option<String>),
+    Details(DResult<Box<ContainerDetails>>),
 }
 
 thread_local! {
@@ -91,6 +97,8 @@ enum ColimaOp {
     Start,
     Stop,
     Restart,
+    /// Starts with a new size, stopping first when the VM is up.
+    Resize { resources: Resources, restart: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -132,13 +140,14 @@ pub struct State {
     pull: Option<String>,
     logs: Option<LogSession>,
     log_generation: u64,
+    pub running_only: bool,
 }
 
 pub struct Controller {
     pub mtm: MainThreadMarker,
     pub window: Retained<NSWindow>,
     /// Controls hold their target weakly, so this keeps it alive.
-    _actions: Retained<Actions>,
+    actions: Retained<Actions>,
     pub sidebar: Sidebar,
     pub toolbar: Toolbar,
     pub containers: Table,
@@ -166,8 +175,16 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
         Some(("Start", Action::ContainerStart)),
         Some(("Stop", Action::ContainerStop)),
         Some(("Restart", Action::ContainerRestart)),
+        Some(("Pause", Action::ContainerPause)),
+        Some(("Resume", Action::ContainerResume)),
         None,
         Some(("Show Logs", Action::ShowLogs)),
+        Some(("Show Details", Action::ShowDetails)),
+        Some(("Open in Terminal", Action::OpenTerminal)),
+        Some(("Open in Browser", Action::OpenPort)),
+        Some(("Show in Finder", Action::RevealMount)),
+        None,
+        Some(("Select Project", Action::SelectProject)),
         Some(("Copy ID", Action::CopyId)),
         None,
         Some(("Remove…", Action::Remove)),
@@ -258,7 +275,7 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
     let ctl = Rc::new(Controller {
         mtm,
         window: window.clone(),
-        _actions: actions,
+        actions,
         sidebar,
         toolbar,
         containers,
@@ -298,7 +315,7 @@ impl Controller {
         let st = self.st.borrow();
         match st.op {
             Some(ColimaOp::Stop) => return Phase::Stopping,
-            Some(ColimaOp::Start | ColimaOp::Restart) => return Phase::Starting,
+            Some(ColimaOp::Start | ColimaOp::Restart | ColimaOp::Resize { .. }) => return Phase::Starting,
             None => {}
         }
         if st.engine_up {
@@ -368,6 +385,7 @@ impl Controller {
                 self.render();
             }
             Msg::LogEnded(generation, error) => self.log_ended(generation, error),
+            Msg::Details(result) => self.details_arrived(result),
         }
     }
 
@@ -539,7 +557,10 @@ impl Controller {
             let now = now();
             let query = st.filter.as_str();
             (
-                filter_rows(pages::container_rows(&st.containers, now), query),
+                filter_rows(
+                    pages::container_rows(st.containers.iter().filter(|c| !st.running_only || c.is_running()), now),
+                    query,
+                ),
                 filter_rows(pages::image_rows(&st.images, &st.containers, now), query),
                 filter_rows(pages::volume_rows(&st.volumes, &st.containers, &st.sizes, now), query),
             )
@@ -593,6 +614,8 @@ impl Controller {
         self.colima_page.start.setEnabled(installed && idle && !up);
         self.colima_page.stop.setEnabled(installed && idle && up);
         self.colima_page.restart.setEnabled(installed && idle && up);
+        let sizable = matches!(phase, Phase::Stopped | Phase::Running | Phase::NoEngine);
+        self.colima_page.resources.setEnabled(installed && idle && sizable);
 
         let (empty_title, empty_detail, show_start) = match phase {
             Phase::NotInstalled => ("Colima is not installed", "Install it with: brew install colima", false),
@@ -633,9 +656,9 @@ impl Controller {
     }
 
     fn render_toolbar(&self) {
-        let (page, up) = {
+        let (page, up, running_only) = {
             let st = self.st.borrow();
-            (st.page, st.engine_up)
+            (st.page, st.engine_up, st.running_only)
         };
         let containers = page == Page::Containers;
         for action in [
@@ -645,16 +668,27 @@ impl Controller {
             Action::ShowLogs,
             Action::Pull,
             Action::Remove,
+            Action::RunningOnly,
             Action::Refresh,
         ] {
             let visible = match action {
-                Action::ContainerStart | Action::ContainerStop | Action::ContainerRestart | Action::ShowLogs => containers,
+                Action::ContainerStart
+                | Action::ContainerStop
+                | Action::ContainerRestart
+                | Action::ShowLogs
+                | Action::RunningOnly => containers,
                 Action::Pull => page == Page::Images,
                 Action::Remove => page != Page::Colima,
                 _ => true,
             };
             self.toolbar.set(action, visible && up, self.can(action));
         }
+        let (icon, tip) = if running_only {
+            ("line.3.horizontal.decrease.circle.fill", "Showing running containers only")
+        } else {
+            ("line.3.horizontal.decrease.circle", "Show running containers only")
+        };
+        self.toolbar.set_icon(Action::RunningOnly, icon, tip);
         self.toolbar.set_search_visible(page != Page::Colima && up);
     }
 
@@ -675,6 +709,17 @@ impl Controller {
             Action::ContainerStop => selected.iter().any(|c| c.is_running()),
             Action::ContainerRestart => !selected.is_empty(),
             Action::ShowLogs => selected.len() == 1,
+            Action::ColimaResources => {
+                self.colima.is_some() && matches!(phase, Phase::Stopped | Phase::Running | Phase::NoEngine)
+            }
+            Action::ContainerPause => selected.iter().any(|c| c.state == "running"),
+            Action::ContainerResume => selected.iter().any(|c| c.state == "paused"),
+            Action::ShowDetails => st.page == Page::Containers && selected.len() == 1,
+            Action::OpenTerminal => matches!(selected.as_slice(), [c] if c.state == "running"),
+            Action::OpenPort => matches!(selected.as_slice(), [c] if !pages::port_links(&c.ports).is_empty()),
+            Action::RevealMount => matches!(selected.as_slice(), [c] if !host_mounts(c).is_empty()),
+            Action::SelectProject => selected.iter().any(|c| !c.project().is_empty()),
+            Action::RunningOnly => st.engine_up,
             Action::Pull | Action::Refresh => st.engine_up,
             Action::Remove | Action::CopyId => match st.page {
                 Page::Colima => false,
@@ -760,6 +805,20 @@ impl Controller {
             Action::LogsFollow => self.logs.toggle_follow(),
             Action::LogsClear => self.logs.clear(),
             Action::LogsClose => self.close_logs(),
+            Action::ColimaResources => self.ask_resources(),
+            Action::ContainerPause => self.container_action(ContainerAction::Pause),
+            Action::ContainerResume => self.container_action(ContainerAction::Unpause),
+            Action::ShowDetails => self.show_details(),
+            Action::OpenTerminal => self.open_terminal(),
+            Action::SelectProject => self.select_project(),
+            Action::RunningOnly => {
+                let mut st = self.st.borrow_mut();
+                st.running_only = !st.running_only;
+                drop(st);
+                self.render();
+            }
+            // These open through the submenus that menu_will_open fills in.
+            Action::OpenPort | Action::RevealMount => {}
         }
     }
 
@@ -789,14 +848,75 @@ impl Controller {
         let on_line = |line| post(Msg::CliLine(line));
         thread::spawn(move || {
             let result = match op {
-                ColimaOp::Start => colima.start(on_line),
+                ColimaOp::Start => colima.start(None, on_line),
                 ColimaOp::Stop => colima.stop(on_line),
                 // `colima restart` takes no --activate flag, and a plain start
                 // may switch the docker context, so this is spelled out.
-                ColimaOp::Restart => colima.stop(on_line).and_then(|()| colima.start(on_line)),
+                ColimaOp::Restart => colima.stop(on_line).and_then(|()| colima.start(None, on_line)),
+                ColimaOp::Resize { resources, restart } => {
+                    let stopped = if restart { colima.stop(on_line) } else { Ok(()) };
+                    stopped.and_then(|()| colima.start(Some(resources), on_line))
+                }
             };
             post(Msg::CliDone(result));
         });
+    }
+
+    /// Asks for a new VM size. Colima only applies it on start, so an up VM is
+    /// restarted, with the same warning as a plain restart.
+    fn ask_resources(&self) {
+        let up = matches!(self.phase(), Phase::Running | Phase::NoEngine);
+        let (current, running) = {
+            let st = self.st.borrow();
+            let current = st.info.as_ref().and_then(Resources::current);
+            (current, st.containers.iter().filter(|c| c.is_running()).count())
+        };
+        let chosen = current.unwrap_or(Resources::DEFAULT);
+        let host = NSProcessInfo::processInfo();
+        let cpu_values: Vec<u32> = (1..=(host.processorCount() as u32).max(chosen.cpus)).collect();
+        let memory_values: Vec<u32> = (1..=((host.physicalMemory() >> 30) as u32).max(chosen.memory)).collect();
+        let disk_values = Resources::disk_choices(current.map(|r| r.disk));
+
+        let cpus = choice_popup(self.mtm, &cpu_values, "", chosen.cpus);
+        let memory = choice_popup(self.mtm, &memory_values, " GiB", chosen.memory);
+        let disk = choice_popup(self.mtm, &disk_values, " GiB", chosen.disk);
+        let grid = NSGridView::gridViewWithNumberOfColumns_rows(2, 0, self.mtm);
+        grid.setRowSpacing(8.0);
+        grid.setColumnSpacing(10.0);
+        for (title, popup) in [("CPUs", &cpus), ("Memory", &memory), ("Disk", &disk)] {
+            let key = label(self.mtm, title, 13.0, unsafe { NSFontWeightRegular });
+            let row: [&NSView; 2] = [&key, popup];
+            grid.addRowWithViews(&NSArray::from_slice(&row));
+        }
+        grid.columnAtIndex(0).setXPlacement(NSGridCellPlacement::Trailing);
+        grid.setFrameSize(grid.fittingSize());
+
+        let detail = if up {
+            let stopping = match running {
+                0 => "No containers are running.".to_string(),
+                n => format!("{n} running {} will stop.", pages::plural(n, "container")),
+            };
+            format!("Colima restarts to apply this. {stopping} Disk size can only grow.")
+        } else {
+            "Colima starts with these settings. Disk size can only grow.".to_string()
+        };
+        let alert = NSAlert::new(self.mtm);
+        alert.setMessageText(&ns("Colima resources"));
+        alert.setInformativeText(&ns(&detail));
+        alert.addButtonWithTitle(&ns(if up { "Restart" } else { "Start" }));
+        alert.addButtonWithTitle(&ns("Cancel"));
+        alert.setAccessoryView(Some(&grid));
+        let block = RcBlock::new(move |response: NSModalResponse| {
+            let pick = |popup: &NSPopUpButton, values: &[u32]| values.get(popup.indexOfSelectedItem() as usize).copied();
+            let picked = (pick(&cpus, &cpu_values), pick(&memory, &memory_values), pick(&disk, &disk_values));
+            let (Some(c), Some(m), Some(d)) = picked else { return };
+            let resources = Resources { cpus: c, memory: m, disk: d };
+            if response != NSAlertFirstButtonReturn || (up && current == Some(resources)) {
+                return;
+            }
+            with_ctl(|ctl| ctl.colima_op(ColimaOp::Resize { resources, restart: up }));
+        });
+        alert.beginSheetModalForWindow_completionHandler(&self.window, Some(&block));
     }
 
     // Containers, images and volumes
@@ -809,6 +929,8 @@ impl Controller {
                 ContainerAction::Start => !c.is_running(),
                 ContainerAction::Stop => c.is_running(),
                 ContainerAction::Restart => true,
+                ContainerAction::Pause => c.state == "running",
+                ContainerAction::Unpause => c.state == "paused",
             };
             keys.into_iter()
                 .filter(|key| st.containers.iter().any(|c| c.id == *key && applies(c)))
@@ -927,6 +1049,148 @@ impl Controller {
         board.setString_forType(&ns(&keys.join("\n")), unsafe { NSPasteboardTypeString });
     }
 
+    /// Selects every container in the Compose projects of the selected ones, so
+    /// the usual actions apply to the whole project.
+    fn select_project(&self) {
+        let keys: Vec<String> = {
+            let st = self.st.borrow();
+            let selected = self.containers.selected_keys();
+            let projects: Vec<&str> = st
+                .containers
+                .iter()
+                .filter(|c| selected.contains(&c.id) && !c.project().is_empty())
+                .map(Container::project)
+                .collect();
+            st.containers.iter().filter(|c| projects.contains(&c.project())).map(|c| c.id.clone()).collect()
+        };
+        self.containers.select_keys(&keys);
+    }
+
+    // Details, terminal, ports and mounts: each runs only when asked for.
+
+    fn show_details(&self) {
+        let id = match self.containers.selected_keys().as_slice() {
+            [id] => id.clone(),
+            _ => return,
+        };
+        let docker = self.docker();
+        thread::spawn(move || post(Msg::Details(docker.inspect(&id).map(Box::new))));
+    }
+
+    fn details_arrived(&self, result: DResult<Box<ContainerDetails>>) {
+        let details = match result {
+            Ok(details) => details,
+            Err(error) => return self.show_error("Could not read the container", &error),
+        };
+        let digests = {
+            let st = self.st.borrow();
+            st.images.iter().find(|i| i.id == details.image).map(|i| i.repo_digests.clone()).unwrap_or_default()
+        };
+        let text = pages::details_text(&pages::container_details(&details, &digests, now()));
+        let (scroll, view) = console(self.mtm);
+        view.setTextContainerInset(NSSize::new(6.0, 6.0));
+        append_text(&view, &text);
+        scroll.setBorderType(NSBorderType::BezelBorder);
+        scroll.setFrameSize(NSSize::new(560.0, 280.0));
+
+        let alert = NSAlert::new(self.mtm);
+        alert.setMessageText(&ns(details.name.trim_start_matches('/')));
+        alert.setInformativeText(&ns(&details.config.image));
+        alert.addButtonWithTitle(&ns("Done"));
+        alert.setAccessoryView(Some(&scroll));
+        alert.beginSheetModalForWindow_completionHandler(&self.window, None);
+    }
+
+    /// Opens a shell in the selected container in Terminal. A .command file
+    /// needs no Automation permission, unlike scripting Terminal.
+    fn open_terminal(&self) {
+        let target = {
+            let st = self.st.borrow();
+            match self.containers.selected_keys().as_slice() {
+                [id] => st.containers.iter().find(|c| c.id == *id && c.state == "running").map(|c| c.id.clone()),
+                _ => None,
+            }
+        };
+        let Some(id) = target else { return };
+        let Some(cli) = find_tool("docker") else {
+            let detail = "Open in Terminal runs docker exec. Install the CLI with: brew install docker";
+            return self.show_error("The Docker CLI is not installed", detail);
+        };
+        let script = exec_script(&cli, self.docker().socket(), &id);
+        let path = env::temp_dir().join(format!("dockerplus-{}.command", short_id(&id)));
+        let written = fs::write(&path, script).and_then(|()| fs::set_permissions(&path, fs::Permissions::from_mode(0o700)));
+        let url = NSURL::fileURLWithPath(&ns(&path.to_string_lossy()));
+        if written.is_err() || !NSWorkspace::sharedWorkspace().openURL(&url) {
+            self.show_error("Could not open Terminal", &path.display().to_string());
+        }
+    }
+
+    /// Fills the per-container submenus of the context menu as it opens.
+    pub fn menu_will_open(&self, menu: &NSMenu) {
+        let ports = menu.itemWithTag(Action::OpenPort as NSInteger);
+        let mounts = menu.itemWithTag(Action::RevealMount as NSInteger);
+        if ports.is_none() && mounts.is_none() {
+            return;
+        }
+        let (links, folders) = {
+            let st = self.st.borrow();
+            match self.containers.selected_keys().as_slice() {
+                [id] => st
+                    .containers
+                    .iter()
+                    .find(|c| c.id == *id)
+                    .map_or_else(Default::default, |c| (pages::port_links(&c.ports), host_mounts(c))),
+                _ => Default::default(),
+            }
+        };
+        self.fill_submenu(ports.as_deref(), links);
+        self.fill_submenu(mounts.as_deref(), folders);
+    }
+
+    fn fill_submenu(&self, item: Option<&NSMenuItem>, entries: Vec<(String, String)>) {
+        let Some(item) = item else { return };
+        if entries.is_empty() {
+            // Without a submenu the item validates through can() and greys out.
+            item.setSubmenu(None);
+            unsafe { item.setAction(Some(sel!(dpPerform:))) };
+            return;
+        }
+        let submenu = NSMenu::new(self.mtm);
+        for (title, location) in entries {
+            let entry = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(self.mtm),
+                    &ns(&title),
+                    Some(sel!(dpOpen:)),
+                    &ns(""),
+                )
+            };
+            unsafe {
+                entry.setTarget(Some(&*self.actions));
+                entry.setRepresentedObject(Some(&*ns(&location)));
+            }
+            submenu.addItem(&entry);
+        }
+        item.setSubmenu(Some(&submenu));
+    }
+
+    /// Opens a URL in the browser, or a host path in Finder.
+    pub fn open_location(&self, location: &str) {
+        let workspace = NSWorkspace::sharedWorkspace();
+        let opened = if location.starts_with("http://") || location.starts_with("https://") {
+            NSURL::URLWithString(&ns(location)).is_some_and(|url| workspace.openURL(&url))
+        } else if Path::new(location).is_dir() {
+            workspace.openURL(&NSURL::fileURLWithPath(&ns(location)))
+        } else {
+            let url = NSURL::fileURLWithPath(&ns(location));
+            workspace.activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&[url]));
+            true
+        };
+        if !opened {
+            self.show_error("Could not open it", location);
+        }
+    }
+
     // Logs
 
     fn open_logs(&self, id: &str) {
@@ -1043,6 +1307,27 @@ impl Controller {
             alert.beginSheetModalForWindow_completionHandler(&self.window, None);
         }
     }
+}
+
+fn choice_popup(mtm: MainThreadMarker, values: &[u32], unit: &str, selected: u32) -> Retained<NSPopUpButton> {
+    let popup = NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), NSRect::ZERO, false);
+    for value in values {
+        popup.addItemWithTitle(&ns(&format!("{value}{unit}")));
+    }
+    if let Some(index) = values.iter().position(|v| *v == selected) {
+        popup.selectItemAtIndex(index as NSInteger);
+    }
+    popup
+}
+
+/// Bind mounts the Mac can open. Colima shares the home folder at the same
+/// path, so only sources inside it name the same place on both sides.
+fn host_mounts(container: &Container) -> Vec<(String, String)> {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else { return Vec::new() };
+    pages::bind_mounts(&container.mounts)
+        .into_iter()
+        .filter(|(_, path)| Path::new(path).starts_with(&home) && Path::new(path).exists())
+        .collect()
 }
 
 /// Follows the engine: long-polls its event stream while it is up, and quietly

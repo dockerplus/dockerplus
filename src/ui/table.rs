@@ -162,13 +162,14 @@ define_class!(
     unsafe impl NSMenuDelegate for TableCtl {
         /// A right click acts on the clicked row even when it was not selected.
         #[unsafe(method(menuNeedsUpdate:))]
-        fn menu_needs_update(&self, _menu: &NSMenu) {
+        fn menu_needs_update(&self, menu: &NSMenu) {
             let Some(table) = self.ivars().table.get() else { return };
             let clicked = table.clickedRow();
             if clicked >= 0 && !table.isRowSelected(clicked) {
                 let row = NSIndexSet::indexSetWithIndex(clicked as usize);
                 table.selectRowIndexes_byExtendingSelection(&row, false);
             }
+            with_ctl(|ctl| ctl.menu_will_open(menu));
         }
     }
 );
@@ -272,7 +273,6 @@ fn make_cell(identifier: &NSString, spec: Column, mtm: MainThreadMarker) -> Reta
 
 pub struct Table {
     pub ctl: Retained<TableCtl>,
-    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     pub view: Retained<NSTableView>,
     pub scroll: Retained<NSScrollView>,
 }
@@ -362,6 +362,17 @@ impl Table {
 
     pub fn selected_keys(&self) -> Vec<String> {
         self.ctl.selected_keys()
+    }
+
+    /// Selects the rows with these keys that are on screen, and no others.
+    pub fn select_keys(&self, keys: &[String]) {
+        let indexes = NSMutableIndexSet::new();
+        for (index, row) in self.ctl.ivars().rows.borrow().iter().enumerate() {
+            if keys.contains(&row.key) {
+                indexes.addIndex(index);
+            }
+        }
+        self.view.selectRowIndexes_byExtendingSelection(&indexes, false);
     }
 
     #[cfg(feature = "devtools")]

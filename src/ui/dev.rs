@@ -25,6 +25,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+/// `kCGWindowListOptionOnScreenAboveWindow`.
+const ON_SCREEN_ABOVE_WINDOW: u32 = 1 << 1;
+
 /// Leaves a line beside the dev socket saying what ended the app.
 pub fn note_exit(mtm: MainThreadMarker) {
     let Some(mut path) = std::env::var_os("DOCKERPLUS_DEV_SOCK") else { return };
@@ -129,7 +132,12 @@ impl Controller {
             }),
             "logs" => self.logs.text.string().to_string(),
             "console" => self.colima_page.console.string().to_string(),
+            "menu" => self.dev_menu(),
+            "menupick" => self.dev_menu_pick(argument),
             "snapshot" => self.dev_snapshot(argument),
+            // A sheet will not capture on its own, so take the window and
+            // everything stacked above it.
+            "sheetshot" => self.dev_capture(self.window.windowNumber(), argument, ON_SCREEN_ABOVE_WINDOW),
             "views" => {
                 let mut out = String::new();
                 if let Some(root) = self.window.contentView().and_then(|view| unsafe { view.superview() }) {
@@ -161,7 +169,7 @@ impl Controller {
         let (summary, activity) = self.hud.text();
         let mut enabled = serde_json::Map::new();
         for name in [
-            "ContainerStart", "ContainerStop", "ContainerRestart", "ShowLogs", "Pull", "Remove", "Refresh",
+            "ContainerStart", "ContainerStop", "ContainerRestart", "ShowLogs", "Pull", "Remove", "RunningOnly", "Refresh",
         ] {
             if let Some(item) = Action::from_name(name).and_then(|a| self.toolbar.item(a)) {
                 enabled.insert(name.into(), json!({"hidden": item.isHidden(), "enabled": item.isEnabled()}));
@@ -183,8 +191,60 @@ impl Controller {
             "toolbar": enabled,
             "logs_visible": !self.logs.view.isHidden(),
             "sheet": self.window.attachedSheet().is_some(),
+            "running_only": st.running_only,
         })
         .to_string()
+    }
+
+    /// The container context menu as it would open now: titles, whether each
+    /// item is enabled, and what its submenu entries open.
+    fn dev_menu(&self) -> String {
+        let Some(menu) = self.containers.view.menu() else { return "no menu".into() };
+        self.menu_will_open(&menu);
+        let mut out = Vec::new();
+        for item in menu.itemArray().iter() {
+            if item.isSeparatorItem() {
+                continue;
+            }
+            let entries: Vec<serde_json::Value> = item.submenu().map_or_else(Vec::new, |submenu| {
+                submenu
+                    .itemArray()
+                    .iter()
+                    .map(|entry| {
+                        let location = entry.representedObject().and_then(|o| o.downcast::<NSString>().ok());
+                        json!({"title": entry.title().to_string(), "opens": location.map(|l| l.to_string())})
+                    })
+                    .collect()
+            });
+            let enabled = item.hasSubmenu() || Action::from_tag(item.tag()).is_none_or(|action| self.can(action));
+            out.push(json!({"title": item.title().to_string(), "enabled": enabled, "submenu": entries}));
+        }
+        json!(out).to_string()
+    }
+
+    /// Picks a context menu item, or a submenu entry, by its title. Goes
+    /// through the menu's own target-action, refusing disabled items.
+    fn dev_menu_pick(&self, title: &str) -> String {
+        let Some(menu) = self.containers.view.menu() else { return "no menu".into() };
+        self.menu_will_open(&menu);
+        for (index, item) in menu.itemArray().iter().enumerate() {
+            if item.title().to_string() == title {
+                if Action::from_tag(item.tag()).is_some_and(|action| !self.can(action)) {
+                    return "refused: disabled".into();
+                }
+                menu.performActionForItemAtIndex(index as NSInteger);
+                return "performed".into();
+            }
+            if let Some(submenu) = item.submenu() {
+                for (index, entry) in submenu.itemArray().iter().enumerate() {
+                    if entry.title().to_string() == title {
+                        submenu.performActionForItemAtIndex(index as NSInteger);
+                        return "performed".into();
+                    }
+                }
+            }
+        }
+        "no such menu item".into()
     }
 
     fn dev_page(&self, name: &str) -> String {
@@ -217,6 +277,7 @@ impl Controller {
             "colima-start" => &self.colima_page.start,
             "colima-stop" => &self.colima_page.stop,
             "colima-restart" => &self.colima_page.restart,
+            "colima-resources" => &self.colima_page.resources,
             "sidebar" => &self.sidebar.button,
             "empty-start" => &self.empty.button,
             _ => return "no such button".into(),
@@ -235,6 +296,18 @@ impl Controller {
         let mut buttons = Vec::new();
         let mut texts = Vec::new();
         collect(&root, &mut buttons, &mut texts);
+        if let Some(rest) = argument.strip_prefix("choose ") {
+            let (index, title) = rest.split_once(' ').unwrap_or((rest, ""));
+            let popups: Vec<Retained<NSPopUpButton>> =
+                buttons.iter().filter_map(|b| b.clone().downcast::<NSPopUpButton>().ok()).collect();
+            return match index.parse::<usize>().ok().and_then(|i| popups.get(i)) {
+                Some(popup) => {
+                    popup.selectItemWithTitle(&ns(title));
+                    popup.titleOfSelectedItem().map_or_else(String::new, |t| t.to_string())
+                }
+                None => "no such popup".into(),
+            };
+        }
         if let Some(text) = argument.strip_prefix("type ") {
             return match texts.iter().find(|field| field.isEditable()) {
                 Some(field) => {
@@ -247,7 +320,9 @@ impl Controller {
         if argument.is_empty() {
             let titles: Vec<String> = buttons.iter().map(|b| b.title().to_string()).collect();
             let labels: Vec<String> = texts.iter().map(|t| t.stringValue().to_string()).collect();
-            return json!({"buttons": titles, "text": labels}).to_string();
+            let mut documents = Vec::new();
+            collect_documents(&root, &mut documents);
+            return json!({"buttons": titles, "text": labels, "documents": documents}).to_string();
         }
         match buttons.iter().find(|b| b.title().to_string() == argument) {
             Some(button) => {
@@ -283,6 +358,10 @@ impl Controller {
     /// Captures this app's own window, which needs no Screen Recording grant.
     /// The function is hidden from the current SDK headers, hence `dlsym`.
     fn dev_snapshot(&self, path: &str) -> String {
+        self.dev_capture(self.window.windowNumber(), path, 0)
+    }
+
+    fn dev_capture(&self, window_number: NSInteger, path: &str, extra_options: u32) -> String {
         #[repr(C)]
         struct CGImage {
             _private: [u8; 0],
@@ -308,7 +387,7 @@ impl Controller {
             }
             let capture: extern "C" fn(Rect, u32, u32, u32) -> *mut CGImage = std::mem::transmute(symbol);
             let null_rect = Rect(f64::INFINITY, f64::INFINITY, 0.0, 0.0);
-            let image = capture(null_rect, INCLUDING_WINDOW, self.window.windowNumber() as u32, BOUNDS_IGNORE_FRAMING);
+            let image = capture(null_rect, INCLUDING_WINDOW | extra_options, window_number as u32, BOUNDS_IGNORE_FRAMING);
             if image.is_null() {
                 return "capture failed".into();
             }
@@ -331,6 +410,16 @@ fn collect(view: &NSView, buttons: &mut Vec<Retained<NSButton>>, texts: &mut Vec
             texts.push(text);
         }
         collect(&child, buttons, texts);
+    }
+}
+
+/// The text of every text view under `view`, such as the details sheet's.
+fn collect_documents(view: &NSView, out: &mut Vec<String>) {
+    for child in view.subviews().iter() {
+        if let Ok(text) = child.clone().downcast::<NSTextView>() {
+            out.push(text.string().to_string());
+        }
+        collect_documents(&child, out);
     }
 }
 

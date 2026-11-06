@@ -26,6 +26,8 @@ pub enum ContainerAction {
     Start,
     Stop,
     Restart,
+    Pause,
+    Unpause,
 }
 
 #[derive(Default)]
@@ -90,8 +92,14 @@ impl Docker {
             ContainerAction::Start => "start",
             ContainerAction::Stop => "stop",
             ContainerAction::Restart => "restart",
+            ContainerAction::Pause => "pause",
+            ContainerAction::Unpause => "unpause",
         };
         self.call("POST", &format!("/containers/{}/{verb}", encode(id)), SLOW).map(drop)
+    }
+
+    pub fn inspect(&self, id: &str) -> DResult<ContainerDetails> {
+        self.get_json(&format!("/containers/{}/json", encode(id)))
     }
 
     pub fn remove_container(&self, id: &str, force: bool) -> DResult<()> {
@@ -210,6 +218,24 @@ fn api_error(status: u16, body: &[u8]) -> String {
         Ok(err) => err.message,
         Err(_) => format!("Docker returned HTTP {status}: {}", String::from_utf8_lossy(body).trim()),
     }
+}
+
+/// A script for Terminal that opens a shell in a running container. It names
+/// the socket itself, so the CLI cannot reach another daemon through a context.
+pub fn exec_script(cli: &Path, socket: &Path, id: &str) -> String {
+    let host = format!("unix://{}", socket.display());
+    let shell = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
+    format!(
+        "#!/bin/sh\nrm -f \"$0\"\nexport DOCKER_HOST={}\nexec {} exec -it {} sh -c {}\n",
+        shell_quote(&host),
+        shell_quote(&cli.to_string_lossy()),
+        shell_quote(id),
+        shell_quote(shell),
+    )
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Splits Docker's multiplexed log stream. Without a TTY every frame carries an
@@ -375,5 +401,13 @@ mod tests {
     fn api_errors_prefer_the_engine_message() {
         assert_eq!(api_error(409, br#"{"message":"volume is in use"}"#), "volume is in use");
         assert_eq!(api_error(500, b"boom"), "Docker returned HTTP 500: boom");
+    }
+
+    #[test]
+    fn terminal_script_is_bound_to_the_colima_socket() {
+        let script = exec_script(Path::new("/usr/local/bin/docker"), Path::new("/Users/a b/.colima/docker.sock"), "abc");
+        assert!(script.contains("export DOCKER_HOST='unix:///Users/a b/.colima/docker.sock'\n"));
+        assert!(script.contains("exec '/usr/local/bin/docker' exec -it 'abc' sh -c '"));
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 }

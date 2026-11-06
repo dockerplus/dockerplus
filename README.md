@@ -10,16 +10,23 @@ Requires macOS 26 or later.
 
 ## Features
 
-- **Colima:** VM status and settings; start, stop and restart with live output.
-- **Containers:** list, start, stop, restart, remove; follow logs.
+- **Colima:** VM status and settings; start, stop and restart with live output;
+  change CPUs, memory and disk.
+- **Containers:** list, start, stop, restart, pause, resume, remove; follow logs;
+  details with image digest, command, ports, mounts and networks.
+- From a container's context menu: open a shell in Terminal, open a published port
+  in the browser, show a bind mount in Finder, or select its whole Compose project.
 - **Images:** list by tag, pull, remove.
 - **Volumes:** list with size and the containers using them; remove.
-- Filter, sort and multi-select in every table, with a context menu.
+- Filter, sort and multi-select in every table. Show only running containers.
 - Updates live from Docker events.
 
-Shortcuts: `⌘1`–`⌘4` switch pages, `⌘F` filter, `⌘L` logs, `⌘R` refresh.
+Shortcuts: `⌘1`–`⌘4` switch pages, `⌘F` filter, `⌘L` logs, `⌘I` details, `⌘R` refresh.
 
 Closing the window quits the app. Colima keeps running.
+
+Open in Terminal needs the Docker CLI (`brew install docker`). Show in Finder lists bind
+mounts inside your home folder, which Colima shares at the same path.
 
 ## Build and run
 
@@ -82,8 +89,7 @@ Engine 29.5.2.
 
 - Not tested yet: physical mouse and keyboard input (tests go through the dev socket),
   macOS 26.x, Reduce Transparency and Increase Contrast.
-- Not supported yet: Colima profiles other than `default`, changing CPU, memory or
-  disk, Compose, networks, per-container stats, opening a shell, signing and
-  notarization.
+- Not supported yet: Colima profiles other than `default`, Compose up and down,
+  networks, per-container stats, signing and notarization.
 - Known issue: a container that floods its logs pushes CPU to about 90% while the log
   panel is open.

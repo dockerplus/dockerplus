@@ -23,6 +23,7 @@ pub struct ColimaPage {
     pub start: Retained<NSButton>,
     pub stop: Retained<NSButton>,
     pub restart: Retained<NSButton>,
+    pub resources: Retained<NSButton>,
     pub console: Retained<NSTextView>,
 }
 
@@ -35,10 +36,12 @@ impl ColimaPage {
         let start = action_button(mtm, actions, "Start", "play.fill", Action::ColimaStart);
         let stop = action_button(mtm, actions, "Stop", "stop.fill", Action::ColimaStop);
         let restart = action_button(mtm, actions, "Restart", "arrow.clockwise", Action::ColimaRestart);
+        let resources = action_button(mtm, actions, "Resources…", "slider.horizontal.3", Action::ColimaResources);
         glass::button(&start, true);
         glass::button(&stop, false);
         glass::button(&restart, false);
-        let buttons = hstack(mtm, 8.0, &[&start, &stop, &restart]);
+        glass::button(&resources, false);
+        let buttons = hstack(mtm, 8.0, &[&start, &stop, &restart, &resources]);
 
         let grid = NSGridView::gridViewWithNumberOfColumns_rows(2, 0, mtm);
         grid.setRowSpacing(7.0);
@@ -88,7 +91,7 @@ impl ColimaPage {
             frame.heightAnchor().constraintGreaterThanOrEqualToConstant(90.0),
         ]);
 
-        Self { view, headline, values, start, stop, restart, console: console_text }
+        Self { view, headline, values, start, stop, restart, resources, console: console_text }
     }
 
     pub fn update(&self, info: &ColimaInfo, engine: Option<&EngineVersion>, headline: &str, status: &str) {

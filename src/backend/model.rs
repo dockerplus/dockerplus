@@ -2,7 +2,7 @@
 //! used to show them.
 
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Docker sends `null` rather than `[]` for several list fields.
 fn null_default<'de, D, T>(de: D) -> Result<T, D::Error>
@@ -66,6 +66,10 @@ pub struct Mount {
     #[serde(rename = "Type")]
     pub kind: String,
     pub name: String,
+    pub source: String,
+    pub destination: String,
+    #[serde(rename = "RW")]
+    pub rw: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
@@ -122,6 +126,77 @@ pub struct EngineVersion {
     pub version: String,
     pub api_version: String,
     pub kernel_version: String,
+}
+
+/// `GET /containers/{id}/json`, only the parts the details sheet shows.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ContainerDetails {
+    pub id: String,
+    pub name: String,
+    pub created: String,
+    pub path: String,
+    #[serde(deserialize_with = "null_default")]
+    pub args: Vec<String>,
+    pub image: String,
+    pub state: ContainerState,
+    pub config: ContainerConfig,
+    pub host_config: HostConfig,
+    #[serde(deserialize_with = "null_default")]
+    pub mounts: Vec<Mount>,
+    pub network_settings: NetworkSettings,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ContainerState {
+    pub status: String,
+    pub exit_code: i64,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ContainerConfig {
+    pub image: String,
+    pub working_dir: String,
+    #[serde(deserialize_with = "null_default")]
+    pub labels: HashMap<String, String>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct HostConfig {
+    pub restart_policy: RestartPolicy,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct RestartPolicy {
+    pub name: String,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct NetworkSettings {
+    /// "80/tcp" to its host bindings, or null when the port is not published.
+    #[serde(deserialize_with = "null_default")]
+    pub ports: BTreeMap<String, Option<Vec<PortBinding>>>,
+    #[serde(deserialize_with = "null_default")]
+    pub networks: BTreeMap<String, Endpoint>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct PortBinding {
+    pub host_ip: String,
+    pub host_port: String,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct Endpoint {
+    #[serde(rename = "IPAddress")]
+    pub ip_address: String,
 }
 
 /// `colima status --json`.
