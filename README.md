@@ -17,7 +17,7 @@
   </picture>
 </p>
 
-<p align="center"><b>1.8 MB</b> app &nbsp;·&nbsp; about <b>55 MB</b> of memory &nbsp;·&nbsp; near <b>0%</b> CPU when idle</p>
+<p align="center"><b>1.9 MB</b> app &nbsp;·&nbsp; about <b>55 MB</b> of memory &nbsp;·&nbsp; near <b>0%</b> CPU when idle</p>
 
 ## What it does
 
@@ -118,7 +118,7 @@ points the Homebrew cask at it.
 `src/backend/` holds the Docker API and Colima CLI code, `src/ui/` the AppKit views.
 Brand guide: [assets/brand/rex/BRAND.md](assets/brand/rex/BRAND.md).
 
-Version 0.1, tested on an M1 Pro MacBook Pro with macOS 27.2, Colima 0.10.3 and Docker Engine
+Version 0.2, tested on an M1 Pro MacBook Pro with macOS 27.2, Colima 0.10.3 and Docker Engine
 29.5.2, where the memory and idle CPU above were measured. Not yet supported: notarization.
 
 ## License

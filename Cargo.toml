@@ -1,6 +1,6 @@
 [package]
 name = "dockerplus"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A native macOS GUI for Colima and Docker, written in Rust on AppKit with real Liquid Glass."
