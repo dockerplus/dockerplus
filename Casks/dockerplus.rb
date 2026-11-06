@@ -1,6 +1,6 @@
 cask "dockerplus" do
-  version "0.1.0"
-  sha256 "37c7321319c033ae33be27dc4ae508759f9af5f4ef7dac04a084cbbbcc920c9e"
+  version "0.2.0"
+  sha256 "109d26327aeb120807bd1d701c8b7d1113b4c620e90adc79a467b88a3779c57c"
 
   url "https://github.com/dockerplus/dockerplus/releases/download/v#{version}/DockerPlus-#{version}-arm64.zip"
   name "DockerPlus"
