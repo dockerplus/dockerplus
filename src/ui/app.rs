@@ -39,7 +39,10 @@ define_class!(
         // Sampling stops while the app is in the background.
         #[unsafe(method(applicationDidBecomeActive:))]
         fn did_become_active(&self, _notification: &NSNotification) {
-            with_ctl(|ctl| ctl.sync_sampler());
+            with_ctl(|ctl| {
+                ctl.sync_sampler();
+                ctl.check_vm_disk();
+            });
         }
 
         #[unsafe(method(applicationDidResignActive:))]

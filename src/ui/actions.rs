@@ -64,7 +64,10 @@ actions! {
     ToggleStats = 58,
     ColimaProfile = 60,
     ColimaNewProfile = 61,
+    ColimaDeleteProfile = 62,
+    ColimaConfig = 63,
     ComposeUp = 70,
+    RunImage = 71,
     CheckUpdates = 80,
 }
 

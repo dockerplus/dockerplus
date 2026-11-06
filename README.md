@@ -17,7 +17,7 @@
   </picture>
 </p>
 
-<p align="center"><b>1.6 MB</b> app &nbsp;·&nbsp; about <b>50 MB</b> of memory &nbsp;·&nbsp; near <b>0%</b> CPU when idle</p>
+<p align="center"><b>1.8 MB</b> app &nbsp;·&nbsp; about <b>55 MB</b> of memory &nbsp;·&nbsp; near <b>0%</b> CPU when idle</p>
 
 ## What it does
 
@@ -26,16 +26,39 @@
   Compose Up starts one from a folder or a Compose file.
 - **Logs:** live, with search. Stays responsive when a container floods them.
 - **CPU and memory:** only when you ask, and never in the background.
-- **Images, volumes, networks, storage:** pull images, see sizes and what uses what, and remove
-  what nothing needs.
-- **Colima:** start, stop, restart. VM Settings changes CPUs, memory, disk, Rosetta and
-  Kubernetes. Each profile is its own VM; its VM type and mount are picked when you create it.
+- **Images, volumes, networks, storage:** pull an image, run it with a few fields, see sizes and
+  what uses what, and remove what nothing needs.
+- **Colima:** start, stop, restart. VM Settings changes CPUs, memory and disk, and opens
+  `colima.yaml` for the rest. Each profile is its own VM, which you can create and delete from
+  the profile menu. A nearly full VM disk is called out on every page.
 
 `⌘1`–`⌘6` pages · `⌘O` Compose Up · `⌘F` filter · `⌘L` logs · `⇧⌘F` find in logs · `⌘I` details · `⇧⌘M` CPU and memory · `⌘R` refresh
 
 ## Install
 
-Needs macOS 26 or later, [Homebrew](https://brew.sh) and the Xcode Command Line Tools.
+Needs macOS 26 or later on Apple silicon, and [Homebrew](https://brew.sh).
+
+```bash
+brew tap dockerplus/dockerplus https://github.com/dockerplus/dockerplus
+brew install --cask dockerplus
+```
+
+This also installs Colima and adds the `dockerplus` command. If you have no Docker command line
+yet, add one:
+
+```bash
+brew install docker docker-compose
+```
+
+The app is not notarized, so macOS blocks its first launch. Open System Settings, go to Privacy &
+Security and choose **Open Anyway**. The first Colima start downloads and sets up its VM, so it
+takes longer than later ones.
+
+To update, choose **Check for Updates…** in the DockerPlus menu. It checks only when you ask.
+
+### From source
+
+Needs the Xcode Command Line Tools as well.
 
 ```bash
 git clone https://github.com/dockerplus/dockerplus
@@ -43,15 +66,9 @@ cd dockerplus
 scripts/install.sh
 ```
 
-This installs what is missing, builds the app from source into `/Applications` and adds the
-`dockerplus` command. A full build takes about 30 seconds on an M1 Pro once Rust is in place.
-
-To update, choose **Check for Updates…** in the DockerPlus menu. It checks only when you ask
-and updates only by fast-forward. Running `git pull` and the script again does the same.
-
-There is no signed download yet. The app is ad-hoc signed, so it is meant for the Mac that
-built it. The first Colima start downloads and sets up its VM, so it takes longer than later
-ones.
+This installs what is missing, builds the app into `/Applications` and adds the `dockerplus`
+command. A full build takes about 30 seconds on an M1 Pro once Rust is in place. If the app is
+open, the script waits for you to quit it.
 
 ## Next to Docker Desktop and OrbStack
 
@@ -91,7 +108,11 @@ The two engines stay separate:
 ```bash
 cargo test
 scripts/bundle.sh --features devtools   # adds a socket that drives the UI in tests
+scripts/package.sh                      # builds the release zip
 ```
+
+Pushing a tag such as `v0.2.0`, matching the version in `Cargo.toml`, publishes a release and
+points the Homebrew cask at it.
 
 `src/backend/` holds the Docker API and Colima CLI code, `src/ui/` the AppKit views.
 Brand guide: [assets/brand/rex/BRAND.md](assets/brand/rex/BRAND.md).

@@ -4,7 +4,7 @@
 use super::actions::{Action, Actions};
 use super::glass;
 use super::util::*;
-use crate::backend::colima::ColimaInfo;
+use crate::backend::colima::{ColimaInfo, DEFAULT_PROFILE};
 use crate::backend::model::{EngineVersion, human_gib};
 use objc2::rc::Retained;
 use objc2::{MainThreadOnly, sel};
@@ -13,10 +13,17 @@ use objc2_foundation::*;
 use std::cell::RefCell;
 
 const KEY_COLUMN_WIDTH: f64 = 110.0;
-const FIELDS: [&str; 10] = [
-    "Status", "CPU", "Memory", "Memory in use", "Disk", "Runtime", "Virtual machine", "Mount", "Docker engine",
-    "Docker socket",
+const FIELDS: [&str; 11] = [
+    "Status", "CPU", "Memory", "Memory in use", "Disk", "Disk in use", "Runtime", "Virtual machine", "Mount",
+    "Docker engine", "Docker socket",
 ];
+
+/// What the profile menu was just used for.
+pub enum ProfilePick {
+    Profile(String),
+    New,
+    Delete,
+}
 
 pub struct ColimaPage {
     pub view: Retained<NSView>,
@@ -119,7 +126,7 @@ impl ColimaPage {
         }
     }
 
-    /// Lists `names` and a last "New Profile…" entry, with `current` chosen.
+    /// Lists `names` and the entries that act on them, with `current` chosen.
     pub fn set_profiles(&self, names: &[String], current: &str, enabled: bool) {
         if *self.profiles.borrow() != names {
             self.profile.removeAllItems();
@@ -129,9 +136,11 @@ impl ColimaPage {
             if let Some(menu) = self.profile.menu() {
                 menu.addItem(&NSMenuItem::separatorItem(self.profile.mtm()));
             }
-            self.profile.addItemWithTitle(&ns("New Profile…"));
-            if let Some(item) = self.profile.lastItem() {
-                item.setTag(Action::ColimaNewProfile as NSInteger);
+            for (title, action) in [("New Profile…", Action::ColimaNewProfile), ("Delete Profile…", Action::ColimaDeleteProfile)] {
+                self.profile.addItemWithTitle(&ns(title));
+                if let Some(item) = self.profile.lastItem() {
+                    item.setTag(action as NSInteger);
+                }
             }
             *self.profiles.borrow_mut() = names.to_vec();
         }
@@ -139,10 +148,13 @@ impl ColimaPage {
         self.profile.setEnabled(enabled);
     }
 
-    /// The profile just picked, or `None` for "New Profile…".
-    pub fn picked_profile(&self) -> Option<String> {
-        let item = self.profile.selectedItem()?;
-        (item.tag() != Action::ColimaNewProfile as NSInteger).then(|| item.title().to_string())
+    pub fn picked_profile(&self) -> ProfilePick {
+        let Some(item) = self.profile.selectedItem() else { return ProfilePick::Profile(DEFAULT_PROFILE.into()) };
+        match Action::from_tag(item.tag()) {
+            Some(Action::ColimaNewProfile) => ProfilePick::New,
+            Some(Action::ColimaDeleteProfile) => ProfilePick::Delete,
+            _ => ProfilePick::Profile(item.title().to_string()),
+        }
     }
 
     pub fn update(
@@ -150,6 +162,7 @@ impl ColimaPage {
         info: &ColimaInfo,
         engine: Option<&EngineVersion>,
         memory_in_use: Option<String>,
+        disk_in_use: Option<String>,
         headline: &str,
         status: &str,
     ) {
@@ -169,7 +182,8 @@ impl ColimaPage {
         let docker = engine.map(|e| format!("{} (API {}, kernel {})", e.version, e.api_version, e.kernel_version));
         let socket = live.map(|s| s.docker_socket.trim_start_matches("unix://").to_string());
 
-        let entries = [Some(status.to_string()), cpu, memory, memory_in_use, disk, runtime, vm, mount, docker, socket];
+        let entries =
+            [Some(status.to_string()), cpu, memory, memory_in_use, disk, disk_in_use, runtime, vm, mount, docker, socket];
         for (field, value) in self.values.iter().zip(entries) {
             let value = value.filter(|v| !v.is_empty()).unwrap_or_else(|| "—".into());
             field.setStringValue(&ns(&value));

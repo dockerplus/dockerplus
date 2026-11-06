@@ -12,14 +12,16 @@
 //!   and the first start hangs for ten minutes before failing with no clue why.
 
 use super::model::{ColimaProfile, ColimaStatus};
+use super::process::{Failure, run_limited};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 const EXTRA_PATHS: [&str; 3] = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"];
 
@@ -29,6 +31,10 @@ const RESERVED_GUEST_USERS: [&str; 18] = [
     "www-data", "backup", "list", "irc", "gnats", "nobody",
 ];
 const GUEST_USER_OVERRIDE: &str = "# Written by DockerPlus: the macOS account name is a system account in Ubuntu.\nuser:\n  name: colima\n";
+
+/// How long a question to Colima may take. A wedged VM can leave `colima status`
+/// or `colima ssh` waiting for good.
+const QUERY_LIMIT: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(20) };
 
 #[derive(Clone, Debug)]
 pub struct Colima {
@@ -52,13 +58,11 @@ pub struct ColimaInfo {
     pub settings: Option<VmSettings>,
 }
 
-/// The parts of a profile's `colima.yaml` the app shows or changes.
+/// The parts of a profile's `colima.yaml` the app shows.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VmSettings {
     pub vm_type: String,
     pub mount_type: String,
-    pub rosetta: bool,
-    pub kubernetes: bool,
 }
 
 /// A VM type with a mount type it supports, offered together so that no
@@ -82,6 +86,13 @@ pub const DEFAULT_PROFILE: &str = "default";
 /// Lima keeps sockets under a path that holds the name, and macOS caps a
 /// socket path at 104 bytes.
 const PROFILE_NAME_MAX: usize = 30;
+
+/// What is in use inside the VM, each as used and total bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VmUsage {
+    pub memory: Option<(u64, u64)>,
+    pub disk: Option<(u64, u64)>,
+}
 
 /// VM size in whole CPUs and GiB, as `colima start` takes it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -128,16 +139,6 @@ impl ResourceChange {
             disk: (wanted.disk > current.disk).then_some(wanted.disk),
             ..Self::default()
         }
-    }
-
-    /// Adds the switches that differ from `current`, where unknown means
-    /// Colima's defaults. Rosetta only exists for vz VMs.
-    pub fn with_switches(mut self, current: Option<&VmSettings>, rosetta: bool, kubernetes: bool) -> Self {
-        let current = current.cloned().unwrap_or_default();
-        let vz = matches!(current.vm_type.as_str(), "vz" | "");
-        self.rosetta = (vz && rosetta != current.rosetta).then_some(rosetta);
-        self.kubernetes = (kubernetes != current.kubernetes).then_some(kubernetes);
-        self
     }
 
     /// Everything for a VM that does not exist yet. Rosetta is only ever
@@ -210,30 +211,34 @@ impl Colima {
         cmd
     }
 
-    pub fn info(&self) -> ColimaInfo {
-        let version = self
-            .command(&["version"])
-            .output()
-            .ok()
-            .and_then(|out| parse_version(&String::from_utf8_lossy(&out.stdout)))
-            .unwrap_or_default();
+    /// Asks Colima something that should come back quickly.
+    fn query(&self, args: &[&str]) -> Result<Output, Failure> {
+        run_limited(&mut self.command(args), QUERY_LIMIT)
+    }
 
-        let status = self
-            .command(&["status", "--json", "--profile", &self.profile])
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .and_then(|out| serde_json::from_slice::<ColimaStatus>(&out.stdout).ok());
+    /// The state of the VM, or `None` when Colima gave no answer in time. Silence
+    /// says nothing about the VM, so it must not read as "stopped" or "gone".
+    pub fn info(&self) -> Option<ColimaInfo> {
+        let version = match self.query(&["version"]) {
+            Err(Failure::TimedOut) => return None,
+            reply => reply.ok().and_then(|out| parse_version(&String::from_utf8_lossy(&out.stdout))).unwrap_or_default(),
+        };
 
-        let listed = self
-            .command(&["list", "--json"])
-            .output()
-            .ok()
-            .map(|out| parse_profiles(&String::from_utf8_lossy(&out.stdout)))
-            .unwrap_or_default();
+        let status = match self.query(&["status", "--json", "--profile", &self.profile]) {
+            Err(Failure::TimedOut) => return None,
+            reply => reply
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| serde_json::from_slice::<ColimaStatus>(&out.stdout).ok()),
+        };
+
+        let listed = match self.query(&["list", "--json"]) {
+            Err(Failure::TimedOut) => return None,
+            reply => reply.ok().map(|out| parse_profiles(&String::from_utf8_lossy(&out.stdout))).unwrap_or_default(),
+        };
         let profile = listed.iter().find(|p| p.name == self.profile).cloned();
 
-        ColimaInfo {
+        Some(ColimaInfo {
             installed: true,
             version,
             running: is_running(status.as_ref(), profile.as_ref()),
@@ -242,7 +247,7 @@ impl Colima {
             profile,
             profiles: listed.into_iter().map(|p| p.name).collect(),
             settings: read_settings(&self.profile),
-        }
+        })
     }
 
     /// Starts the VM with `change` applied. Colima saves the new size in its
@@ -255,10 +260,18 @@ impl Colima {
         self.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), on_line)
     }
 
-    /// Memory in use inside the VM and its total, in bytes.
-    pub fn vm_memory(&self) -> Option<(u64, u64)> {
-        let output = self.command(&["ssh", "--profile", &self.profile, "--", "free", "-b"]).output().ok()?;
-        parse_free(&String::from_utf8_lossy(&output.stdout))
+    /// Memory and disk together: each `colima ssh` starts a chain of processes.
+    pub fn vm_usage(&self) -> Option<VmUsage> {
+        const SCRIPT: &str = "free -b; df -B1 --output=used,avail /var/lib/docker";
+        let output = self.query(&["ssh", "--profile", &self.profile, "--", "sh", "-c", SCRIPT]).ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        Some(VmUsage { memory: parse_free(&text), disk: parse_df(&text) })
+    }
+
+    /// Removes the VM and everything in it. `--data` takes the disk with it,
+    /// which Colima would otherwise keep for the next VM of that name.
+    pub fn delete(&self, on_line: impl FnMut(String)) -> Result<(), String> {
+        self.run(&["delete", "--force", "--data", "--profile", self.profile.as_str()], on_line)
     }
 
     pub fn stop(&self, on_line: impl FnMut(String)) -> Result<(), String> {
@@ -339,6 +352,11 @@ fn lima_instance(profile: &str) -> String {
 /// What the profile's config says. Colima fixes the VM and mount type when it
 /// creates the VM and keeps them in the instance's own copy, which wins over
 /// any later edit of the config.
+/// The config file of a profile, once it has one.
+pub fn config_file(profile: &str) -> Option<PathBuf> {
+    Some(colima_home().join(profile).join("colima.yaml")).filter(|path| path.is_file())
+}
+
 fn read_settings(profile: &str) -> Option<VmSettings> {
     let home = colima_home();
     let read = |path: PathBuf| fs::read_to_string(path).ok().map(|text| parse_settings(&text));
@@ -355,26 +373,16 @@ fn read_settings(profile: &str) -> Option<VmSettings> {
     Some(settings)
 }
 
-/// Reads the few keys we need from Colima's YAML, which is flat but for
-/// `kubernetes.enabled`. Missing keys keep Colima's defaults: `rosetta` is
-/// left out when false.
+/// Reads the few keys we need from Colima's YAML. They are all at the top level.
 fn parse_settings(text: &str) -> VmSettings {
     let mut settings = VmSettings::default();
-    let mut section = "";
-    for line in text.lines() {
+    for line in text.lines().filter(|line| !line.starts_with([' ', '\t'])) {
         let line = line.split(" #").next().unwrap_or("");
         let Some((key, value)) = line.split_once(':') else { continue };
-        let nested = line.starts_with([' ', '\t']);
-        let key = key.trim();
         let value = value.trim().trim_matches(['"', '\'']);
-        if !nested {
-            section = key;
-        }
-        match (nested, section, key) {
-            (false, _, "vmType") => settings.vm_type = value.to_string(),
-            (false, _, "mountType") => settings.mount_type = value.to_string(),
-            (false, _, "rosetta") => settings.rosetta = value == "true",
-            (true, "kubernetes", "enabled") => settings.kubernetes = value == "true",
+        match key.trim() {
+            "vmType" => settings.vm_type = value.to_string(),
+            "mountType" => settings.mount_type = value.to_string(),
             _ => {}
         }
     }
@@ -421,6 +429,15 @@ fn parse_free(text: &str) -> Option<(u64, u64)> {
     let fields: Vec<u64> = line.split_whitespace().skip(1).filter_map(|field| field.parse().ok()).collect();
     let (total, available) = (*fields.first()?, *fields.get(5)?);
     Some((total.saturating_sub(available), total))
+}
+
+/// Reads `df --output=used,avail`. Total is what the two add up to, as `df` does
+/// for its own percentage: a filesystem keeps some blocks back from ordinary users.
+fn parse_df(text: &str) -> Option<(u64, u64)> {
+    let mut lines = text.lines().skip_while(|line| !line.trim_start().starts_with("Used"));
+    let mut fields = lines.nth(1)?.split_whitespace().map(|field| field.parse::<u64>().ok());
+    let (used, available) = (fields.next()??, fields.next()??);
+    Some((used, used + available))
 }
 
 fn colima_home() -> PathBuf {
@@ -547,6 +564,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_reading_gives_memory_and_disk() {
+        let text = "               total        used        free      shared  buff/cache   available\n\
+                    Mem:      4095643648   337481728  3345489920      733184   555458560  3758161920\n\
+                    Swap:              0           0           0\n   \
+                    Used       Avail\n5828608 99987164416\n";
+        assert_eq!(parse_free(text), Some((337481728, 4095643648)));
+        assert_eq!(parse_df(text), Some((5828608, 5828608 + 99987164416)));
+        assert_eq!(parse_df("df: /var/lib/docker: No such file or directory\n"), None);
+    }
+
+    #[test]
+    fn a_colima_that_does_not_answer_is_not_a_stopped_vm() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = env::temp_dir().join(format!("dp-silent-colima-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("colima");
+        fs::write(&bin, "#!/bin/sh\n[ \"$1\" = version ] && exit 0\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let colima = Colima { bin, profile: "default".into() };
+
+        assert!(colima.info().is_none());
+        assert_eq!(colima.vm_usage(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn every_start_refuses_to_change_the_docker_context() {
         let plain = ["start", "--activate=false", "--profile", "default"];
         assert_eq!(start_args("default", ResourceChange::default()), plain);
@@ -573,25 +616,10 @@ mod tests {
     }
 
     #[test]
-    fn only_switches_that_changed_reach_colima() {
-        let vz = VmSettings { vm_type: "vz".into(), rosetta: true, ..Default::default() };
-        let same = ResourceChange::default().with_switches(Some(&vz), true, false);
-        assert!(same.is_empty());
-        let both = ResourceChange::default().with_switches(Some(&vz), false, true);
-        assert_eq!(start_args("default", both)[4..], ["--vz-rosetta=false", "--kubernetes=true"]);
-        let qemu = VmSettings { vm_type: "qemu".into(), ..Default::default() };
-        assert_eq!(ResourceChange::default().with_switches(Some(&qemu), true, false).rosetta, None);
-        assert!(ResourceChange::default().with_switches(None, false, false).is_empty());
-    }
-
-    #[test]
     fn settings_come_from_colima_yaml() {
-        let text = "cpu: 2\nkubernetes:\n  enabled: true # k3s\n  version: v1.35.0+k3s1\n  k3sArgs:\n    - --disable=traefik\n\
-                    network:\n  enabled: false\nvmType: \"vz\"\nrosetta: true\nmountType: virtiofs\n";
-        let expected = VmSettings { vm_type: "vz".into(), mount_type: "virtiofs".into(), rosetta: true, kubernetes: true };
-        assert_eq!(parse_settings(text), expected);
-        let off = parse_settings("kubernetes:\n  enabled: false\nnetwork:\n  enabled: true\nvmType: qemu\n");
-        assert_eq!(off, VmSettings { vm_type: "qemu".into(), ..Default::default() });
+        let text = "cpu: 2\nkubernetes:\n  enabled: true # k3s\n  vmType: nested\n\
+                    network:\n  enabled: false\nvmType: \"vz\" # the default\nmountType: virtiofs\n";
+        assert_eq!(parse_settings(text), VmSettings { vm_type: "vz".into(), mount_type: "virtiofs".into() });
     }
 
     #[test]

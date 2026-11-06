@@ -208,6 +208,7 @@ pub struct ImageUsage {
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ContainerUsage {
+    pub id: String,
     #[serde(deserialize_with = "null_default")]
     pub names: Vec<String>,
     pub state: String,
@@ -221,11 +222,21 @@ impl ContainerUsage {
     }
 }
 
-/// What a prune would remove right now: names, with the space each frees where
-/// that is known, and the total.
+/// One thing a prune would remove.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PruneItem {
+    pub name: String,
+    /// The space it frees, where that is known.
+    pub size: Option<i64>,
+    /// What to ask the engine to remove: a container's ID, a volume's name or an
+    /// image's tags. An image goes with its last tag, an untagged one by its ID.
+    pub targets: Vec<String>,
+}
+
+/// What a prune would remove right now, and the total.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PrunePreview {
-    pub items: Vec<(String, Option<i64>)>,
+    pub items: Vec<PruneItem>,
     pub size: i64,
 }
 
@@ -289,14 +300,22 @@ impl DiskUsage {
             Prune::Containers => {
                 let stopped: Vec<&ContainerUsage> = self.containers.iter().filter(|c| c.is_stopped()).collect();
                 PrunePreview {
-                    items: stopped.iter().map(|c| (container_label(c), Some(c.size_rw))).collect(),
+                    items: stopped
+                        .iter()
+                        .map(|c| PruneItem { name: container_label(c), size: Some(c.size_rw), targets: vec![c.id.clone()] })
+                        .collect(),
                     size: stopped.iter().map(|c| c.size_rw.max(0)).sum(),
                 }
             }
             // Images share layers, so one image's size says little about what
             // removing it frees; only the engine's total is given.
             Prune::Images => PrunePreview {
-                items: self.images.iter().filter(|i| i.containers == 0).map(|i| (image_label(i), None)).collect(),
+                items: self
+                    .images
+                    .iter()
+                    .filter(|i| i.containers == 0)
+                    .map(|i| PruneItem { name: image_label(i), size: None, targets: image_targets(i) })
+                    .collect(),
                 size: self.image_usage.reclaimable,
             },
             Prune::Volumes => {
@@ -306,7 +325,14 @@ impl DiskUsage {
                     .filter_map(|v| v.usage_data.filter(|u| u.ref_count == 0).map(|u| (v.name.as_str(), u.size)))
                     .collect();
                 PrunePreview {
-                    items: unused.iter().map(|(name, size)| (name.to_string(), Some(*size))).collect(),
+                    items: unused
+                        .iter()
+                        .map(|(name, size)| PruneItem {
+                            name: name.to_string(),
+                            size: Some(*size),
+                            targets: vec![name.to_string()],
+                        })
+                        .collect(),
                     size: unused.iter().map(|(_, size)| size.max(&0)).sum(),
                 }
             }
@@ -317,6 +343,10 @@ impl DiskUsage {
 
 fn container_label(container: &ContainerUsage) -> String {
     container.names.first().map_or("<unnamed>", |name| name.trim_start_matches('/')).to_string()
+}
+
+fn image_targets(image: &ImageUsage) -> Vec<String> {
+    if image.repo_tags.is_empty() { vec![image.id.clone()] } else { image.repo_tags.clone() }
 }
 
 fn image_label(image: &ImageUsage) -> String {
@@ -724,17 +754,31 @@ mod tests {
             "Images":[{"Id":"sha256:aaaaaaaaaaaaaaaa","RepoTags":["nginx:alpine","web:1"],"Containers":0},
                       {"Id":"sha256:bbbbbbbbbbbbbbbb","RepoTags":null,"Containers":0},
                       {"Id":"sha256:cccccccccccccccc","RepoTags":["db:16"],"Containers":2}],
-            "Containers":[{"Names":["/old"],"State":"exited","SizeRw":5},{"Names":["/up"],"State":"paused","SizeRw":7}],
+            "Containers":[{"Id":"c1","Names":["/old"],"State":"exited","SizeRw":5},{"Id":"c2","Names":["/up"],"State":"paused","SizeRw":7}],
             "Volumes":[{"Name":"data","UsageData":{"RefCount":0,"Size":500}},{"Name":"used","UsageData":{"RefCount":2,"Size":9}}]}"#;
         let usage: DiskUsage = serde_json::from_str(json).unwrap();
 
         let images = usage.preview(Prune::Images);
-        let names: Vec<&str> = images.items.iter().map(|(name, _)| name.as_str()).collect();
+        let names: Vec<&str> = images.items.iter().map(|item| item.name.as_str()).collect();
         assert_eq!(names, ["nginx:alpine (+1 tags)", "<none> bbbbbbbbbbbb"]);
         assert_eq!(images.size, 300);
-        assert_eq!(usage.preview(Prune::Containers).items, [("old".to_string(), Some(5))]);
-        assert_eq!(usage.preview(Prune::Volumes), PrunePreview { items: vec![("data".into(), Some(500))], size: 500 });
+        let item = |name: &str, size, target: &str| PruneItem {
+            name: name.into(),
+            size: Some(size),
+            targets: vec![target.into()],
+        };
+        assert_eq!(usage.preview(Prune::Containers).items, [item("old", 5, "c1")]);
+        assert_eq!(usage.preview(Prune::Volumes), PrunePreview { items: vec![item("data", 500, "data")], size: 500 });
         assert!(usage.preview(Prune::BuildCache).items.is_empty());
+    }
+
+    #[test]
+    fn an_image_is_removed_by_every_tag_or_else_by_id() {
+        let json = r#"{"Images":[{"Id":"sha256:aaaa","RepoTags":["nginx:alpine","web:1"],"Containers":0},
+                                 {"Id":"sha256:bbbb","RepoTags":null,"Containers":0}]}"#;
+        let usage: DiskUsage = serde_json::from_str(json).unwrap();
+        let targets: Vec<Vec<String>> = usage.preview(Prune::Images).items.into_iter().map(|i| i.targets).collect();
+        assert_eq!(targets, [vec!["nginx:alpine".to_string(), "web:1".to_string()], vec!["sha256:bbbb".to_string()]]);
     }
 
     #[test]

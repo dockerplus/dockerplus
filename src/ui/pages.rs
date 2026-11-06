@@ -226,7 +226,8 @@ pub fn storage_summary(lines: &[StorageLine], on_mac: Option<u64>) -> String {
 pub fn prune_prompt(kind: Prune, preview: &PrunePreview) -> Option<(String, String)> {
     let count = preview.items.len();
     let size = human_size(preview.size);
-    let list = name_list(&preview.items);
+    let shown: Vec<(String, Option<i64>)> = preview.items.iter().map(|item| (item.name.clone(), item.size)).collect();
+    let list = name_list(&shown);
     let prompt = match kind {
         _ if count == 0 && kind != Prune::BuildCache => return None,
         Prune::BuildCache if preview.size <= 0 => return None,
@@ -321,9 +322,18 @@ pub fn stats_text(label: &str, reading: &StatsReading) -> String {
     format!("{label}: {cpu}, RAM {memory} of {}", human_gib(reading.limit as i64))
 }
 
-pub fn vm_memory_text(used: u64, total: u64) -> String {
+pub fn vm_usage_text(used: u64, total: u64) -> String {
     let percent = (used * 100).checked_div(total).unwrap_or(0);
     format!("{} of {} ({percent}%)", human_memory(used as i64), human_gib(total as i64))
+}
+
+/// Said from here on, since pulls and builds start failing soon after.
+const VM_DISK_NEARLY_FULL: u64 = 90;
+
+pub fn vm_disk_warning(disk: Option<(u64, u64)>) -> Option<String> {
+    let (used, total) = disk?;
+    let percent = (used * 100).checked_div(total)?;
+    (percent >= VM_DISK_NEARLY_FULL).then(|| format!("VM disk {percent}% full"))
 }
 
 pub fn image_rows(images: &[Image], containers: &[Container], now: i64) -> Vec<Row> {
@@ -630,7 +640,8 @@ mod tests {
 
     #[test]
     fn volume_prompts_warn_about_data() {
-        let preview = PrunePreview { items: vec![("data".into(), Some(1_000)), ("cache".into(), Some(0))], size: 1_000 };
+        let item = |name: &str, size| PruneItem { name: name.into(), size: Some(size), targets: Vec::new() };
+        let preview = PrunePreview { items: vec![item("data", 1_000), item("cache", 0)], size: 1_000 };
         let (title, detail) = prune_prompt(Prune::Volumes, &preview).unwrap();
         assert_eq!(title, "Remove unused volumes?");
         assert!(detail.starts_with("2 volumes no container uses, named ones included, 1.0 KB:\n• data (1.0 KB)\n• cache\n"));
@@ -639,10 +650,18 @@ mod tests {
 
     #[test]
     fn prompts_name_the_first_few_and_count_the_rest() {
-        let items: Vec<(String, Option<i64>)> = (1..=11).map(|n| (format!("img{n}"), None)).collect();
+        let items: Vec<PruneItem> = (1..=11).map(|n| PruneItem { name: format!("img{n}"), ..PruneItem::default() }).collect();
         let (_, detail) = prune_prompt(Prune::Images, &PrunePreview { items, size: 5 }).unwrap();
         assert!(detail.contains("• img8\n• and 3 more"));
         assert!(!detail.contains("img9"));
+    }
+
+    #[test]
+    fn a_nearly_full_vm_disk_is_called_out() {
+        assert_eq!(vm_disk_warning(None), None);
+        assert_eq!(vm_disk_warning(Some((0, 0))), None);
+        assert_eq!(vm_disk_warning(Some((89, 100))), None);
+        assert_eq!(vm_disk_warning(Some((90, 100))).as_deref(), Some("VM disk 90% full"));
     }
 
     #[test]
@@ -672,7 +691,7 @@ mod tests {
         assert_eq!(stats_text("web", &reading), "web: CPU 3.2%, RAM 114 MiB of 2 GiB");
         let first = StatsReading { cpu: None, memory: 0, limit: 0 };
         assert_eq!(stats_text("web", &first), "web: CPU …, RAM 0 B");
-        assert_eq!(vm_memory_text(1 << 30, 2 << 30), "1.0 GiB of 2 GiB (50%)");
+        assert_eq!(vm_usage_text(1 << 30, 2 << 30), "1.0 GiB of 2 GiB (50%)");
     }
 
     #[test]

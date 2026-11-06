@@ -4,7 +4,7 @@
 
 use super::controller::{Controller, with_ctl};
 use super::util::ns;
-use crate::backend::update::{self, Notice, SOURCE_KEY};
+use crate::backend::update::{self, Notice, SOURCE_KEY, Step};
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2_app_kit::*;
@@ -12,7 +12,7 @@ use objc2_foundation::*;
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,7 +34,8 @@ pub fn check() {
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from);
     thread::spawn(move || {
-        let notice = update::notice(&update::check(source.as_deref()));
+        let install = update::how_installed(source.as_deref());
+        let notice = update::notice(env!("CARGO_PKG_VERSION"), update::latest(), &install);
         DispatchQueue::main().exec_async(move || {
             CHECKING.store(false, Ordering::Relaxed);
             with_ctl(|ctl| show(ctl, notice));
@@ -47,14 +48,20 @@ fn show(ctl: &Controller, notice: Notice) {
     alert.setAlertStyle(if notice.warning { NSAlertStyle::Warning } else { NSAlertStyle::Informational });
     alert.setMessageText(&ns(&notice.title));
     alert.setInformativeText(&ns(&notice.detail));
-    let offer = notice.update;
-    if offer.is_some() {
-        alert.addButtonWithTitle(&ns("Update"));
+    let step = notice.step;
+    if let Some(step) = &step {
+        alert.addButtonWithTitle(&ns(if matches!(step, Step::OpenPage(_)) { "Download" } else { "Update" }));
         alert.addButtonWithTitle(&ns("Later"));
     }
     let respond = move |response: NSModalResponse| {
-        if let (true, Some(dir)) = (response == NSAlertFirstButtonReturn, &offer) {
-            with_ctl(|ctl| open_update(ctl, dir));
+        match (response == NSAlertFirstButtonReturn, &step) {
+            (true, Some(Step::OpenPage(url))) => {
+                with_ctl(|ctl| ctl.open_location(url));
+            }
+            (true, Some(Step::RunScript(script))) => {
+                with_ctl(|ctl| open_update(ctl, script));
+            }
+            _ => {}
         }
     };
     ctl.window.makeKeyAndOrderFront(None);
@@ -65,10 +72,10 @@ fn show(ctl: &Controller, notice: Notice) {
     }
 }
 
-/// Pulls and reinstalls in Terminal, where the user can watch the build and
-/// answer anything git asks. A .command file needs no Automation permission.
-fn open_update(ctl: &Controller, dir: &Path) {
-    let script = update::update_script(&update::git_tool(), dir);
+/// Runs an update in Terminal, where the user can watch it and answer anything
+/// it asks. A .command file needs no Automation permission. The app then quits,
+/// asking first if Colima is mid-start, since its files are about to be replaced.
+fn open_update(ctl: &Controller, script: &str) {
     // Unique per request: the script deletes itself when it starts.
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let path = env::temp_dir().join(format!("dockerplus-update-{stamp}.command"));
@@ -76,6 +83,7 @@ fn open_update(ctl: &Controller, dir: &Path) {
     let url = NSURL::fileURLWithPath(&ns(&path.to_string_lossy()));
     if written.is_err() || !NSWorkspace::sharedWorkspace().openURL(&url) {
         let detail = path.display().to_string();
-        show(ctl, Notice { title: "Could not open Terminal".into(), detail, warning: true, update: None });
+        return show(ctl, Notice { title: "Could not open Terminal".into(), detail, warning: true, step: None });
     }
+    NSApplication::sharedApplication(ctl.mtm).terminate(None);
 }

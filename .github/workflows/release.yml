@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo test --locked
+      - run: scripts/package.sh "$GITHUB_REF_NAME"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" target/dist/* --verify-tag --generate-notes
+      - name: Point the cask at it
+        run: |
+          git fetch origin main
+          git checkout -B main FETCH_HEAD
+          version=${GITHUB_REF_NAME#v}
+          sha=$(cut -d' ' -f1 target/dist/*.sha256)
+          sed -i '' -E "s/^  version .*/  version \"$version\"/; s/^  sha256 .*/  sha256 \"$sha\"/" Casks/dockerplus.rb
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -am "chore: point the cask at $GITHUB_REF_NAME"
+          git push origin main

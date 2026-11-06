@@ -18,13 +18,14 @@ struct Item {
     icon: &'static str,
 }
 
-const ITEMS: [Item; 11] = [
+const ITEMS: [Item; 12] = [
     Item { id: "dp.start", action: Action::ContainerStart, label: "Start", icon: "play.fill" },
     Item { id: "dp.stop", action: Action::ContainerStop, label: "Stop", icon: "stop.fill" },
     Item { id: "dp.restart", action: Action::ContainerRestart, label: "Restart", icon: "arrow.clockwise" },
     Item { id: "dp.logs", action: Action::ShowLogs, label: "Logs", icon: "text.alignleft" },
     Item { id: "dp.compose-up", action: Action::ComposeUp, label: "Compose Up", icon: "folder.badge.plus" },
     Item { id: "dp.pull", action: Action::Pull, label: "Pull Image", icon: "arrow.down.circle" },
+    Item { id: "dp.run", action: Action::RunImage, label: "Run Image", icon: "play.circle" },
     Item { id: "dp.remove", action: Action::Remove, label: "Remove", icon: "trash" },
     Item { id: "dp.running", action: Action::RunningOnly, label: "Running Only", icon: "line.3.horizontal.decrease.circle" },
     Item { id: "dp.stats", action: Action::ToggleStats, label: "CPU and Memory", icon: "chart.bar" },

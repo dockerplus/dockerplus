@@ -4,13 +4,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo build --release "$@"
+cargo build --release --locked "$@"
 
 APP=target/DockerPlus.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/dockerplus-app "$APP/Contents/MacOS/DockerPlus"
 cp assets/Info.plist "$APP/Contents/Info.plist"
+version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+plutil -replace CFBundleShortVersionString -string "$version" "$APP/Contents/Info.plist"
 cp bin/dockerplus "$APP/Contents/Resources/dockerplus"
 if [ -f assets/AppIcon.icns ]; then
     cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"

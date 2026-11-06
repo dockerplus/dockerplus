@@ -2,7 +2,7 @@
 //! to the main thread, and [`Controller::render`] brings the views in line.
 
 use super::actions::{Action, Actions};
-use super::colima_page::ColimaPage;
+use super::colima_page::{ColimaPage, ProfilePick};
 use super::hud::{EmptyState, HUD_CLEARANCE, Hud};
 use super::logs::{LogCleaner, LogPanel};
 use super::pages::{self, Page};
@@ -11,11 +11,12 @@ use super::table::{Table, filter_rows};
 use super::toolbar::Toolbar;
 use super::util::*;
 use crate::backend::colima::{
-    Colima, ColimaInfo, DEFAULT_PROFILE, ResourceChange, Resources, VM_KINDS, disk_on_mac, find_tool, profile_choices,
-    profile_name_problem,
+    Colima, ColimaInfo, DEFAULT_PROFILE, ResourceChange, Resources, VM_KINDS, VmUsage, config_file, disk_on_mac,
+    find_tool, profile_choices, profile_name_problem,
 };
 use crate::backend::docker::{
-    ContainerAction, DResult, Docker, Scope, Snapshot, compose, compose_up, compose_up_args, exec_script, shared_with_vm,
+    ContainerAction, DResult, Docker, RunForm, Scope, Snapshot, compose, compose_up, compose_up_args, exec_script,
+    run_args, run_image, shared_with_vm, unshared_mounts,
 };
 use crate::backend::http::Cancel;
 use crate::backend::model::*;
@@ -32,6 +33,7 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +67,9 @@ const ENGINE_RETRY: Duration = Duration::from_secs(2);
 /// reading starts a chain of processes through `colima ssh`.
 const STATS_PERIOD: Duration = Duration::from_secs(2);
 const VM_MEMORY_PERIOD: Duration = Duration::from_secs(30);
+/// How long a reading of the VM's disk stands when no sampler is running. It is
+/// taken when the app comes to the front, never on a timer.
+const VM_DISK_PERIOD: Duration = Duration::from_secs(600);
 /// Between stats passes the sampler rests this many times as long as the pass
 /// took, so measuring stays a small share of the engine's time at any scale.
 const STATS_REST_RATIO: u32 = 20;
@@ -72,6 +77,9 @@ const STATS_REST_RATIO: u32 = 20;
 const SAMPLER_WAKE: Duration = Duration::from_millis(250);
 /// How often to re-ask Colima while it says "running" but Docker is silent.
 const COLIMA_RECHECK: Duration = Duration::from_secs(3);
+/// A VM can stay running with no Docker for good: a containerd profile, or a
+/// crashed dockerd. Each check starts three processes, so they thin out to this.
+const COLIMA_RECHECK_LONGEST: Duration = Duration::from_secs(60);
 /// The pause before reopening an event stream that ended, doubling while they
 /// keep ending at once, up to the ceiling.
 const EVENTS_RETRY: Duration = Duration::from_millis(300);
@@ -80,8 +88,10 @@ const EVENTS_RETRY_MAX: Duration = Duration::from_secs(30);
 const EVENTS_HEALTHY: Duration = Duration::from_secs(10);
 
 pub enum Msg {
-    /// Tagged with its profile, so a late reply cannot land on another one.
-    Colima(String, Box<ColimaInfo>),
+    /// Numbered in the order they were asked for, and tagged with the profile, so
+    /// a late reply cannot overwrite a newer one or land on another profile. No
+    /// info means Colima gave no answer in time.
+    Colima(u64, String, Option<Box<ColimaInfo>>),
     /// The watcher's generation, and whether the engine answered.
     Engine(u64, bool),
     Changed(Scope),
@@ -99,12 +109,17 @@ pub enum Msg {
     Storage(u64, DResult<Vec<StorageLine>>, Option<u64>),
     Pruned(DResult<i64>),
     Stats(StatsReading),
-    VmMemory(u64, u64),
+    VmUsage(u64, VmUsage),
     PrunePreview(u64, Prune, DResult<PrunePreview>),
 }
 
 thread_local! {
     static CTL: OnceCell<Rc<Controller>> = const { OnceCell::new() };
+}
+
+/// How long to wait before asking Colima again, after `tries` unsettled checks.
+fn recheck_delay(tries: u32) -> Duration {
+    (COLIMA_RECHECK * 2u32.saturating_pow(tries)).min(COLIMA_RECHECK_LONGEST)
 }
 
 /// Runs `body` with the controller. Called from AppKit callbacks on the main
@@ -145,6 +160,7 @@ enum ColimaOp {
     Restart,
     /// Starts with a new size, stopping first when the VM is up.
     Resize { change: ResourceChange, restart: bool },
+    Delete,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -211,7 +227,17 @@ pub struct State {
     storage_loading: bool,
     storage_again: bool,
     storage_error: Option<String>,
-    recheck_scheduled: bool,
+    /// The Colima recheck waiting to fire, by number, so one that is no longer
+    /// wanted can be told apart from the one that is.
+    recheck_timer: Option<u64>,
+    recheck_timers: u64,
+    /// Checks in a row that left Colima unsettled.
+    recheck_tries: u32,
+    /// The number of the latest Colima reply asked for, and shown.
+    colima_asked: u64,
+    colima_shown: u64,
+    /// Colima's latest reply never came, so `info` may be out of date.
+    colima_silent: bool,
     busy_actions: usize,
     pull: Option<String>,
     logs: Option<LogSession>,
@@ -223,7 +249,17 @@ pub struct State {
     mac_disk: Option<u64>,
     pub stats_on: bool,
     sampler: Option<Sampler>,
-    vm_memory: Option<(u64, u64)>,
+    vm_usage: VmUsage,
+    vm_disk_read: Option<Instant>,
+}
+
+impl State {
+    /// Colima settled, so the next doubt starts from the shortest wait. A long
+    /// wait left running would hold that first check back by up to a minute.
+    fn forget_rechecks(&mut self) {
+        self.recheck_tries = 0;
+        self.recheck_timer = None;
+    }
 }
 
 pub struct Controller {
@@ -274,7 +310,13 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
         None,
         Some(("Remove…", Action::Remove)),
     ]);
-    let images = table(pages::IMAGE_COLUMNS, &[Some(("Copy ID", Action::CopyId)), None, Some(("Remove…", Action::Remove))]);
+    let images = table(pages::IMAGE_COLUMNS, &[
+        Some(("Run…", Action::RunImage)),
+        None,
+        Some(("Copy ID", Action::CopyId)),
+        None,
+        Some(("Remove…", Action::Remove)),
+    ]);
     let volumes = table(pages::VOLUME_COLUMNS, &[Some(("Copy Name", Action::CopyId)), None, Some(("Remove…", Action::Remove))]);
     let networks = table(pages::NETWORK_COLUMNS, &[
         Some(("Copy ID", Action::CopyId)),
@@ -452,7 +494,7 @@ impl Controller {
     fn phase(&self) -> Phase {
         let st = self.st.borrow();
         match st.op {
-            Some(ColimaOp::Stop) => return Phase::Stopping,
+            Some(ColimaOp::Stop | ColimaOp::Delete) => return Phase::Stopping,
             Some(ColimaOp::Start | ColimaOp::Restart | ColimaOp::Resize { .. }) => return Phase::Starting,
             None => {}
         }
@@ -470,16 +512,25 @@ impl Controller {
 
     pub fn handle(&self, msg: Msg) {
         match msg {
-            Msg::Colima(profile, info) => {
-                let current = profile == self.st.borrow().profile;
-                if !current || self.leave_vanished_profile(&info) {
-                    return;
+            Msg::Colima(number, profile, info) => {
+                {
+                    let mut st = self.st.borrow_mut();
+                    if profile != st.profile || number < st.colima_shown {
+                        return;
+                    }
+                    st.colima_shown = number;
+                    st.colima_silent = info.is_none();
                 }
-                if let Some(socket) = info.status.as_ref().map(|s| s.docker_socket.as_str()) {
-                    self.adopt_socket(socket);
+                if let Some(info) = info {
+                    if self.leave_vanished_profile(&info) {
+                        return;
+                    }
+                    if let Some(socket) = info.status.as_ref().map(|s| s.docker_socket.as_str()) {
+                        self.adopt_socket(socket);
+                    }
+                    self.st.borrow_mut().info = Some(*info);
+                    self.render_chrome();
                 }
-                self.st.borrow_mut().info = Some(*info);
-                self.render_chrome();
                 self.recheck_if_unsettled();
             }
             Msg::Engine(generation, up) => {
@@ -504,10 +555,14 @@ impl Controller {
             }
             Msg::CliLine(line) => self.colima_page.log_line(&line),
             Msg::CliDone(result) => {
-                self.st.borrow_mut().op = None;
+                let op = self.st.borrow_mut().op.take();
+                let deleted = op == Some(ColimaOp::Delete) && result.is_ok();
                 if let Err(error) = result {
                     self.colima_page.log_line(&format!("Failed: {error}"));
                     self.show_error("Colima could not finish", &error);
+                }
+                if deleted {
+                    self.select_profile(DEFAULT_PROFILE);
                 }
                 self.reload_colima();
                 self.render_chrome();
@@ -550,6 +605,8 @@ impl Controller {
                     }
                     Err(error) => self.show_error("Docker refused that", &error),
                 }
+                self.st.borrow_mut().vm_disk_read = None;
+                self.check_vm_disk();
                 self.refresh(Scope::ALL);
                 self.render_chrome();
             }
@@ -558,10 +615,10 @@ impl Controller {
                     self.hud.set_stats(Some(&pages::stats_text(&self.stats_label(), &reading)));
                 }
             }
-            Msg::VmMemory(used, total) => {
-                if self.sampling(SampleKind::Vm) {
-                    self.st.borrow_mut().vm_memory = Some((used, total));
-                    self.render_status();
+            Msg::VmUsage(epoch, usage) => {
+                if self.current(epoch) {
+                    self.st.borrow_mut().vm_usage = usage;
+                    self.render_chrome();
                 }
             }
             Msg::PrunePreview(epoch, kind, result) => self.prune_preview_arrived(epoch, kind, result),
@@ -586,24 +643,43 @@ impl Controller {
             return;
         };
         let profile = colima.profile().to_string();
-        thread::spawn(move || post(Msg::Colima(profile, Box::new(colima.info()))));
+        let number = {
+            let mut st = self.st.borrow_mut();
+            st.colima_asked += 1;
+            st.colima_asked
+        };
+        thread::spawn(move || post(Msg::Colima(number, profile, colima.info().map(Box::new))));
     }
 
     /// Nothing announces a VM going down when its socket has already gone, and
-    /// Colima keeps listing it as running for a few seconds. Keep asking until
-    /// it says stopped or Docker answers, so the UI cannot stick on "Waiting".
+    /// Colima keeps listing it as running for a few seconds. Keep asking, less
+    /// and less often, until it says stopped or Docker answers, so the UI cannot
+    /// stick on "Waiting". A Colima that stopped answering gets the same.
     fn recheck_if_unsettled(&self) {
-        {
+        let (delay, timer) = {
             let mut st = self.st.borrow_mut();
             let running = st.info.as_ref().is_some_and(|info| info.running);
-            if !running || st.engine_up || st.op.is_some() || st.recheck_scheduled {
+            if !(running || st.colima_silent) || st.engine_up || st.op.is_some() {
+                st.forget_rechecks();
                 return;
             }
-            st.recheck_scheduled = true;
-        }
-        after_main(COLIMA_RECHECK, || {
+            if st.recheck_timer.is_some() {
+                return;
+            }
+            st.recheck_timers += 1;
+            st.recheck_timer = Some(st.recheck_timers);
+            st.recheck_tries += 1;
+            (recheck_delay(st.recheck_tries - 1), st.recheck_timers)
+        };
+        after_main(delay, move || {
             with_ctl(|ctl| {
-                ctl.st.borrow_mut().recheck_scheduled = false;
+                {
+                    let mut st = ctl.st.borrow_mut();
+                    if st.recheck_timer != Some(timer) {
+                        return;
+                    }
+                    st.recheck_timer = None;
+                }
                 ctl.reload_colima();
             });
         });
@@ -622,7 +698,8 @@ impl Controller {
                 st.sizes.clear();
                 st.storage.clear();
                 st.engine = None;
-                st.vm_memory = None;
+                st.vm_usage = VmUsage::default();
+                st.vm_disk_read = None;
                 st.retrying = false;
                 st.storage_error = None;
                 st.storage_again = false;
@@ -649,6 +726,7 @@ impl Controller {
         }
         self.reload_colima();
         self.sync_sampler();
+        self.check_vm_disk();
         self.render();
     }
 
@@ -875,8 +953,11 @@ impl Controller {
             Phase::Stopped if !info.provisioned => "No virtual machine yet. The first start downloads one.".to_string(),
             _ => version,
         };
-        let memory_in_use = st.vm_memory.map(|(used, total)| pages::vm_memory_text(used, total));
-        self.colima_page.update(&info, st.engine.as_ref(), memory_in_use, &headline, title);
+        let memory_in_use = st.vm_usage.memory.map(|(used, total)| pages::vm_usage_text(used, total));
+        let disk_in_use = st.vm_usage.disk.map(|(used, total)| pages::vm_usage_text(used, total));
+        let disk_warning = pages::vm_disk_warning(st.vm_usage.disk);
+        let disk_in_use = disk_in_use.map(|text| if disk_warning.is_some() { format!("{text}, nearly full") } else { text });
+        self.colima_page.update(&info, st.engine.as_ref(), memory_in_use, disk_in_use, &headline, title);
 
         let idle = st.op.is_none();
         let installed = self.colima.is_some();
@@ -919,6 +1000,10 @@ impl Controller {
             Page::Networks => pages::networks_summary(&st.networks),
             Page::Storage => pages::storage_summary(&st.storage, st.mac_disk),
         };
+        let summary = match pages::vm_disk_warning(st.vm_usage.disk) {
+            Some(warning) if page != Page::Colima => format!("{warning}  ·  {summary}"),
+            _ => summary,
+        };
         self.window.setTitle(&ns(page.title()));
         self.window.setSubtitle(&ns(if up { &summary } else { "" }));
         self.hud.set_summary(&summary);
@@ -947,6 +1032,7 @@ impl Controller {
             Action::ShowLogs,
             Action::ComposeUp,
             Action::Pull,
+            Action::RunImage,
             Action::Remove,
             Action::RunningOnly,
             Action::ToggleStats,
@@ -961,7 +1047,7 @@ impl Controller {
                 | Action::ComposeUp
                 | Action::RunningOnly
                 | Action::ToggleStats => containers,
-                Action::Pull => page == Page::Images,
+                Action::Pull | Action::RunImage => page == Page::Images,
                 Action::Prune => matches!(page, Page::Storage | Page::Networks),
                 Action::Remove => matches!(page, Page::Containers | Page::Images | Page::Volumes | Page::Networks),
                 _ => true,
@@ -990,7 +1076,9 @@ impl Controller {
             Action::LogsFind => !self.logs.view.isHidden(),
             // Not while half-started: the sizes Colima reports then are unreliable.
             Action::ColimaResources => self.colima.is_some() && matches!(phase, Phase::Stopped | Phase::Running),
-            Action::ColimaProfile | Action::ColimaNewProfile => self.colima.is_some() && st.op.is_none(),
+            Action::ColimaProfile | Action::ColimaNewProfile | Action::ColimaDeleteProfile => {
+                self.colima.is_some() && st.op.is_none()
+            }
             Action::ContainerPause => selected.iter().any(|c| c.state == "running"),
             Action::ContainerResume => selected.iter().any(|c| c.state == "paused"),
             Action::ShowDetails => st.page == Page::Containers && selected.len() == 1,
@@ -1000,7 +1088,7 @@ impl Controller {
             Action::SelectProject => selected.iter().any(|c| !c.project().is_empty()),
             Action::RunningOnly => st.engine_up,
             Action::CheckUpdates => !super::updates::checking(),
-            Action::Pull | Action::Refresh | Action::ComposeUp => st.engine_up,
+            Action::Pull | Action::RunImage | Action::Refresh | Action::ComposeUp => st.engine_up,
             Action::Remove if st.page == Page::Networks => !self.removable_networks().is_empty(),
             Action::Remove | Action::CopyId => match st.page {
                 Page::Colima | Page::Storage => false,
@@ -1152,6 +1240,7 @@ impl Controller {
             Action::ShowStorage => self.sidebar.select(Page::Storage),
             Action::Prune => self.ask_prune(),
             Action::ComposeUp => self.ask_compose_up(),
+            Action::RunImage => self.ask_run_image(),
             Action::LogsFind => {
                 if !self.logs.view.isHidden() {
                     self.logs.show_find(&self.window, self.mtm);
@@ -1162,15 +1251,19 @@ impl Controller {
             Action::LogsClear => self.logs.clear(),
             Action::LogsClose => self.close_logs(),
             Action::ColimaResources => self.ask_resources(),
-            Action::ColimaProfile => match self.colima_page.picked_profile() {
-                Some(name) => self.select_profile(&name),
-                None => {
-                    // "New Profile…" is not a profile: show the current one again.
-                    self.render_status();
-                    self.ask_new_profile(NewProfile::default());
+            Action::ColimaProfile => {
+                let pick = self.colima_page.picked_profile();
+                // The last two entries are not profiles: show the current one again.
+                self.render_status();
+                match pick {
+                    ProfilePick::Profile(name) => self.select_profile(&name),
+                    ProfilePick::New => self.ask_new_profile(NewProfile::default()),
+                    ProfilePick::Delete => self.ask_delete_profile(),
                 }
-            },
+            }
             Action::ColimaNewProfile => self.ask_new_profile(NewProfile::default()),
+            Action::ColimaDeleteProfile => self.ask_delete_profile(),
+            Action::ColimaConfig => self.open_colima_config(),
             Action::ContainerPause => self.container_action(ContainerAction::Pause),
             Action::ContainerResume => self.container_action(ContainerAction::Unpause),
             Action::ShowDetails => self.show_details(),
@@ -1190,10 +1283,13 @@ impl Controller {
     // Colima
 
     fn confirm_colima(&self, op: ColimaOp) {
-        let running = self.st.borrow().containers.iter().filter(|c| c.is_running()).count();
+        let (running, profile) = {
+            let st = self.st.borrow();
+            (st.containers.iter().filter(|c| c.is_running()).count(), st.profile.clone())
+        };
         let (verb, button) = if op == ColimaOp::Stop { ("Stop", "Stop") } else { ("Restart", "Restart") };
         let detail = running_note(running);
-        self.confirm(&format!("{verb} Colima?"), &detail, button, move |ctl| ctl.colima_op(op));
+        self.confirm(&format!("{verb} Colima profile “{profile}”?"), &detail, button, move |ctl| ctl.colima_op(op));
     }
 
     fn colima_op(&self, op: ColimaOp) {
@@ -1212,6 +1308,8 @@ impl Controller {
             let result = match op {
                 ColimaOp::Start => colima.start(ResourceChange::default(), on_line),
                 ColimaOp::Stop => colima.stop(on_line),
+                // A stop closes the VM's ssh connection, which a delete leaves behind.
+                ColimaOp::Delete => colima.stop(on_line).and_then(|()| colima.delete(on_line)),
                 // `colima restart` takes no --activate flag, and a plain start
                 // may switch the docker context, so this is spelled out.
                 ColimaOp::Restart => {
@@ -1226,15 +1324,35 @@ impl Controller {
         });
     }
 
-    /// Asks for a new VM size and switches. Colima only applies them on start,
-    /// so an up VM is restarted, with the same warning as a plain restart.
+    fn ask_delete_profile(&self) {
+        if self.colima.is_none() || self.st.borrow().op.is_some() {
+            return;
+        }
+        let profile = self.st.borrow().profile.clone();
+        let detail = "Its VM goes, with every container, image and volume in it. This cannot be undone.";
+        self.confirm(&format!("Delete profile “{profile}”?"), detail, "Delete", |ctl| ctl.colima_op(ColimaOp::Delete));
+    }
+
+    /// In a text editor, whatever the Mac has set for YAML. The sheet that
+    /// offers it closes: an edit takes effect at the next start, not through it.
+    fn open_colima_config(&self) {
+        if let Some(sheet) = self.window.attachedSheet() {
+            self.window.endSheet_returnCode(&sheet, NSModalResponseCancel);
+        }
+        let Some(path) = config_file(&self.st.borrow().profile) else { return };
+        // Waited for off the main thread, so it does not stay behind as a zombie.
+        thread::spawn(move || Command::new("/usr/bin/open").arg("-t").arg(&path).status());
+    }
+
+    /// Asks for a new VM size, which is all most people ever change. Colima only
+    /// applies it on start, so an up VM is restarted, with the same warning as a
+    /// plain restart. Everything else is in `colima.yaml`, one click from here.
     fn ask_resources(&self) {
         let up = self.phase() == Phase::Running;
-        let (current, settings, running) = {
+        let (current, running, profile) = {
             let st = self.st.borrow();
             let current = st.info.as_ref().and_then(Resources::current);
-            let settings = st.info.as_ref().and_then(|info| info.settings.clone()).unwrap_or_default();
-            (current, settings, st.containers.iter().filter(|c| c.is_running()).count())
+            (current, st.containers.iter().filter(|c| c.is_running()).count(), st.profile.clone())
         };
         let chosen = current.unwrap_or(Resources::DEFAULT);
         let host = NSProcessInfo::processInfo();
@@ -1248,40 +1366,37 @@ impl Controller {
         let grid = NSGridView::gridViewWithNumberOfColumns_rows(2, 0, self.mtm);
         grid.setRowSpacing(8.0);
         grid.setColumnSpacing(10.0);
+        grid.setRowAlignment(NSGridRowAlignment::FirstBaseline);
         for (title, popup) in [("CPUs", &cpus), ("Memory", &memory), ("Disk", &disk)] {
             let key = label(self.mtm, title, 13.0, unsafe { NSFontWeightRegular });
             let row: [&NSView; 2] = [&key, popup];
             grid.addRowWithViews(&NSArray::from_slice(&row));
+            activate(&[popup.widthAnchor().constraintEqualToConstant(120.0)]);
         }
-        let add_row = |title: &str, view: &NSView| {
-            let key = label(self.mtm, title, 13.0, unsafe { NSFontWeightRegular });
+        let add_row = |view: &NSView| {
+            let key = label(self.mtm, "", 13.0, unsafe { NSFontWeightRegular });
             let row: [&NSView; 2] = [&key, view];
             grid.addRowWithViews(&NSArray::from_slice(&row));
         };
-        let value = |text: &str| label(self.mtm, if text.is_empty() { "—" } else { text }, 13.0, unsafe { NSFontWeightRegular });
-        let vz = matches!(settings.vm_type.as_str(), "vz" | "");
-        let rosetta = checkbox(self.mtm, if vz { "Rosetta for x86 images" } else { "Rosetta (VZ only)" }, settings.rosetta);
-        rosetta.setEnabled(vz);
-        let kubernetes = checkbox(self.mtm, "Kubernetes", settings.kubernetes);
-        add_row("VM type", &value(&settings.vm_type));
-        add_row("Mount", &value(&settings.mount_type));
-        add_row("", &secondary_label(self.mtm, "To use a different VM type or mount, create a new profile.", 11.0));
-        // Rosetta needs Apple silicon, where this build then runs natively.
-        if cfg!(target_arch = "aarch64") {
-            add_row("", &rosetta);
+        add_row(&secondary_label(self.mtm, "Disk size can only grow.", 11.0));
+        if config_file(&profile).is_some() {
+            let edit = unsafe {
+                NSButton::buttonWithTitle_target_action(&ns("Edit colima.yaml…"), Some(&*self.actions), Some(sel!(dpPerform:)), self.mtm)
+            };
+            edit.setTag(Action::ColimaConfig as NSInteger);
+            edit.setControlSize(NSControlSize::Small);
+            add_row(&edit);
         }
-        add_row("", &kubernetes);
-        add_row("", &secondary_label(self.mtm, "Kubernetes runs in the VM and takes more of its CPU and memory.", 11.0));
         grid.columnAtIndex(0).setXPlacement(NSGridCellPlacement::Trailing);
         grid.setFrameSize(grid.fittingSize());
 
         let detail = if up {
-            format!("Colima restarts to apply changes. {} Disk size can only grow.", running_note(running))
+            format!("Colima restarts to apply changes. {}", running_note(running))
         } else {
-            "Colima starts with these settings. Disk size can only grow.".to_string()
+            "Colima starts with these settings.".to_string()
         };
         let alert = NSAlert::new(self.mtm);
-        alert.setMessageText(&ns(&format!("Settings for “{}”", self.st.borrow().profile)));
+        alert.setMessageText(&ns(&format!("Settings for “{profile}”")));
         alert.setInformativeText(&ns(&detail));
         alert.addButtonWithTitle(&ns(if up { "Restart" } else { "Start" }));
         alert.addButtonWithTitle(&ns("Cancel"));
@@ -1291,8 +1406,7 @@ impl Controller {
             let picked = (pick(&cpus, &cpu_values), pick(&memory, &memory_values), pick(&disk, &disk_values));
             let (Some(c), Some(m), Some(d)) = picked else { return };
             if response == NSAlertFirstButtonReturn {
-                let switches = (is_on(&rosetta), is_on(&kubernetes));
-                with_ctl(|ctl| ctl.apply_resources(Resources { cpus: c, memory: m, disk: d }, switches));
+                with_ctl(|ctl| ctl.apply_resources(Resources { cpus: c, memory: m, disk: d }));
             }
         });
         alert.beginSheetModalForWindow_completionHandler(&self.window, Some(&block));
@@ -1301,14 +1415,10 @@ impl Controller {
     /// Judged now, not when the sheet opened: Colima may have been started or
     /// stopped from a terminal in between, and a start on a running VM would
     /// quietly ignore the new size.
-    fn apply_resources(&self, wanted: Resources, (rosetta, kubernetes): (bool, bool)) {
+    fn apply_resources(&self, wanted: Resources) {
         let up = matches!(self.phase(), Phase::Running | Phase::NoEngine);
-        let (current, settings) = {
-            let st = self.st.borrow();
-            let info = st.info.as_ref();
-            (info.and_then(Resources::current), info.and_then(|info| info.settings.clone()))
-        };
-        let change = ResourceChange::between(current, wanted).with_switches(settings.as_ref(), rosetta, kubernetes);
+        let current = self.st.borrow().info.as_ref().and_then(Resources::current);
+        let change = ResourceChange::between(current, wanted);
         if !(up && change.is_empty()) {
             self.colima_op(ColimaOp::Resize { change, restart: up });
         }
@@ -1323,7 +1433,10 @@ impl Controller {
             }
             st.profile = name.to_string();
             st.info = None;
-            st.vm_memory = None;
+            st.colima_silent = false;
+            st.forget_rechecks();
+            st.vm_usage = VmUsage::default();
+            st.vm_disk_read = None;
             // It holds the old profile's Colima; sync_sampler starts a new one.
             if let Some(sampler) = st.sampler.take() {
                 sampler.stop.store(true, Ordering::Relaxed);
@@ -1657,9 +1770,11 @@ impl Controller {
         if !self.current(epoch) {
             return;
         }
-        match result.map(|preview| pages::prune_prompt(kind, &preview)) {
-            Ok(Some((title, detail))) => self.confirm(&title, &detail, "Remove", move |ctl| ctl.prune(kind)),
-            Ok(None) => {
+        match result.map(|preview| (pages::prune_prompt(kind, &preview), preview)) {
+            Ok((Some((title, detail)), preview)) => {
+                self.confirm(&title, &detail, "Remove", move |ctl| ctl.prune(kind, preview));
+            }
+            Ok((None, _)) => {
                 let (title, detail) = pages::prune_nothing(kind);
                 self.show_notice(&title, &detail);
             }
@@ -1684,17 +1799,110 @@ impl Controller {
         });
     }
 
-    fn prune(&self, kind: Prune) {
+    /// Removes what `preview` listed, the list the user just confirmed.
+    fn prune(&self, kind: Prune, preview: PrunePreview) {
         self.st.borrow_mut().busy_actions += 1;
         self.render_chrome();
         let docker = self.docker();
         thread::spawn(move || {
             let before = docker.disk_usage().unwrap_or_default();
-            let result = docker.prune(kind).map(|reported| {
+            let removed = if kind == Prune::BuildCache {
+                docker.clear_build_cache()
+            } else {
+                let refused = docker.remove_listed(kind, &preview.items);
+                pages::batch_error(preview.items.len(), &refused).map_or(Ok(preview.size), Err)
+            };
+            let result = removed.map(|expected| {
                 let after = docker.disk_usage().unwrap_or_default();
-                freed_bytes(kind, &before, &after, reported)
+                freed_bytes(kind, &before, &after, expected)
             });
             post(Msg::Pruned(result));
+        });
+    }
+
+    fn ask_run_image(&self) {
+        let image = self.current_table().and_then(|table| table.selected_keys().into_iter().next()).unwrap_or_default();
+        self.show_run_form(RunForm { image, ..RunForm::default() }, None);
+    }
+
+    /// A few fields for the common `docker run`. Anything more is for the command
+    /// line. A form that cannot work comes back with the reason.
+    fn show_run_form(&self, form: RunForm, problem: Option<String>) {
+        let field = |value: &str, placeholder: &str| {
+            let frame = NSRect::new(NSPoint::ZERO, NSSize::new(280.0, 22.0));
+            let field = NSTextField::initWithFrame(NSTextField::alloc(self.mtm), frame);
+            field.setStringValue(&ns(value));
+            field.setPlaceholderString(Some(&ns(placeholder)));
+            field
+        };
+        let image = field(&form.image, "nginx:alpine");
+        let name = field(&form.name, "Optional");
+        let ports = field(&form.ports, "8080:80 8443:443");
+        let env = field(&form.env, "MODE=dev DEBUG=1");
+        let volumes = field(&form.volumes, "data:/var/lib/data ~/site:/srv");
+        let grid = NSGridView::gridViewWithNumberOfColumns_rows(2, 0, self.mtm);
+        grid.setRowSpacing(8.0);
+        grid.setColumnSpacing(10.0);
+        for (title, view) in [("Image", &image), ("Name", &name), ("Ports", &ports), ("Environment", &env), ("Volumes", &volumes)] {
+            let key = label(self.mtm, title, 13.0, unsafe { NSFontWeightRegular });
+            let row: [&NSView; 2] = [&key, &**view];
+            grid.addRowWithViews(&NSArray::from_slice(&row));
+        }
+        grid.columnAtIndex(0).setXPlacement(NSGridCellPlacement::Trailing);
+        grid.setFrameSize(grid.fittingSize());
+
+        let profile = self.st.borrow().profile.clone();
+        let detail = problem.unwrap_or_else(|| format!("Starts in the background on profile “{profile}”. Separate lists with spaces."));
+        let alert = NSAlert::new(self.mtm);
+        alert.setMessageText(&ns("Run an image"));
+        alert.setInformativeText(&ns(&detail));
+        alert.addButtonWithTitle(&ns("Run"));
+        alert.addButtonWithTitle(&ns("Cancel"));
+        alert.setAccessoryView(Some(&grid));
+        alert.window().setInitialFirstResponder(Some(if form.image.is_empty() { &image } else { &name }));
+        let block = RcBlock::new(move |response: NSModalResponse| {
+            if response != NSAlertFirstButtonReturn {
+                return;
+            }
+            let text = |field: &NSTextField| field.stringValue().to_string();
+            let form = RunForm {
+                image: text(&image),
+                name: text(&name),
+                ports: text(&ports),
+                env: text(&env),
+                volumes: text(&volumes),
+            };
+            with_ctl(|ctl| ctl.run_form(form));
+        });
+        alert.beginSheetModalForWindow_completionHandler(&self.window, Some(&block));
+    }
+
+    fn run_form(&self, form: RunForm) {
+        let home = env::var_os("HOME").map(PathBuf::from);
+        let args = match run_args(&form, home.as_deref()) {
+            Ok(args) => args,
+            Err(problem) => {
+                // After this sheet has gone, so the next one can attach.
+                after_main(Duration::ZERO, move || {
+                    with_ctl(|ctl| ctl.show_run_form(form, Some(problem)));
+                });
+                return;
+            }
+        };
+        let unshared = home.map(|home| unshared_mounts(&form, &home)).unwrap_or_default();
+        if unshared.is_empty() {
+            return self.run_docker(move |docker| run_image(docker.socket(), &args).err());
+        }
+        let detail = format!(
+            "{}\n\nColima shares only your home folder with its VM, so these come up empty.",
+            unshared.join("\n")
+        );
+        after_main(Duration::ZERO, move || {
+            with_ctl(|ctl| {
+                ctl.confirm("This folder is outside your home folder", &detail, "Run", move |ctl| {
+                    ctl.run_docker(move |docker| run_image(docker.socket(), &args).err());
+                });
+            });
         });
     }
 
@@ -1706,7 +1914,8 @@ impl Controller {
         field.setPlaceholderString(Some(&ns("nginx:alpine")));
         let alert = NSAlert::new(self.mtm);
         alert.setMessageText(&ns("Pull an image"));
-        alert.setInformativeText(&ns("Pulled into Colima's Docker engine. Without a tag, “latest” is used."));
+        let profile = self.st.borrow().profile.clone();
+        alert.setInformativeText(&ns(&format!("Pulled into profile “{profile}”. Without a tag, “latest” is used.")));
         alert.addButtonWithTitle(&ns("Pull"));
         alert.addButtonWithTitle(&ns("Cancel"));
         alert.setAccessoryView(Some(&field));
@@ -1794,6 +2003,7 @@ impl Controller {
             sampler.stop.store(true, Ordering::Relaxed);
         }
         let Some(kind) = want else { return };
+        let epoch = self.st.borrow().epoch;
         let stop = Arc::new(AtomicBool::new(false));
         let targets = Arc::new(Mutex::new(Vec::new()));
         self.st.borrow_mut().sampler = Some(Sampler { kind, stop: stop.clone(), targets: targets.clone() });
@@ -1819,14 +2029,35 @@ impl Controller {
                 let Some(colima) = self.colima() else { return };
                 thread::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        if let Some((used, total)) = colima.vm_memory() {
-                            post(Msg::VmMemory(used, total));
+                        if let Some(usage) = colima.vm_usage() {
+                            post(Msg::VmUsage(epoch, usage));
                         }
                         rest(VM_MEMORY_PERIOD, || stop.load(Ordering::Relaxed));
                     }
                 });
             }
         }
+    }
+
+    /// One reading of the VM's disk, so a nearly full one shows on every page. The
+    /// Colima page keeps its own up to date, through the sampler.
+    pub fn check_vm_disk(&self) {
+        let active = NSApplication::sharedApplication(self.mtm).isActive();
+        let epoch = {
+            let mut st = self.st.borrow_mut();
+            let fresh = st.vm_disk_read.is_some_and(|read| read.elapsed() < VM_DISK_PERIOD);
+            if !st.engine_up || !active || fresh {
+                return;
+            }
+            st.vm_disk_read = Some(Instant::now());
+            st.epoch
+        };
+        let Some(colima) = self.colima() else { return };
+        thread::spawn(move || {
+            if let Some(usage) = colima.vm_usage() {
+                post(Msg::VmUsage(epoch, usage));
+            }
+        });
     }
 
     fn sampling(&self, kind: SampleKind) -> bool {
@@ -2371,6 +2602,13 @@ impl LogBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colima_rechecks_thin_out_to_once_a_minute() {
+        let waits: Vec<u64> = (0..8).map(|tries| recheck_delay(tries).as_secs()).collect();
+        assert_eq!(waits, [3, 6, 12, 24, 48, 60, 60, 60]);
+        assert_eq!(recheck_delay(u32::MAX), COLIMA_RECHECK_LONGEST);
+    }
 
     #[test]
     fn event_stream_retries_back_off_and_start_over() {

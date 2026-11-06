@@ -367,7 +367,7 @@ impl Controller {
             "enabled": popup.isEnabled(),
             "listed": st.info.as_ref().map(|i| i.profiles.clone()),
             "settings": settings.map(|s| json!({
-                "vm_type": s.vm_type, "mount_type": s.mount_type, "rosetta": s.rosetta, "kubernetes": s.kubernetes,
+                "vm_type": s.vm_type, "mount_type": s.mount_type,
             })),
         })
         .to_string()
@@ -405,6 +405,17 @@ impl Controller {
                     popup.titleOfSelectedItem().map_or_else(String::new, |t| t.to_string())
                 }
                 None => "no such popup".into(),
+            };
+        }
+        if let Some(rest) = argument.strip_prefix("field ") {
+            let (index, value) = rest.split_once(' ').unwrap_or((rest, ""));
+            let editable: Vec<_> = texts.iter().filter(|field| field.isEditable()).collect();
+            return match index.parse::<usize>().ok().and_then(|i| editable.get(i)) {
+                Some(field) => {
+                    field.setStringValue(&ns(value));
+                    "typed".into()
+                }
+                None => "no such field".into(),
             };
         }
         if let Some(text) = argument.strip_prefix("type ") {

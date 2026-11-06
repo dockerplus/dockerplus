@@ -172,28 +172,51 @@ impl Docker {
         Ok(self.get_json::<DiskUsage>("/system/df")?.lines())
     }
 
-    /// Removes everything of this kind that nothing is using. Returns the bytes
-    /// the engine says it freed.
-    pub fn prune(&self, kind: Prune) -> DResult<i64> {
+    /// Removes what a confirmation listed and nothing else, one by one, and
+    /// returns what the engine refused and why. The engine's own prune would
+    /// choose afresh, and take whatever stopped or came free while the dialog
+    /// was open. This way, anything put back to use meanwhile is simply refused.
+    pub fn remove_listed(&self, kind: Prune, items: &[PruneItem]) -> Vec<(String, String)> {
+        let remove = |item: &PruneItem| item.targets.iter().find_map(|target| self.remove_target(kind, target).err());
+        // An image can be refused until the ones built on it have gone, so
+        // whatever failed gets one more try.
+        let refused: Vec<&PruneItem> = items.iter().filter(|item| remove(item).is_some()).collect();
+        refused.into_iter().filter_map(|item| remove(item).map(|error| (item.name.clone(), error))).collect()
+    }
+
+    fn remove_target(&self, kind: Prune, target: &str) -> DResult<()> {
+        let collection = match kind {
+            Prune::Containers => "containers",
+            Prune::Images => "images",
+            Prune::Volumes => "volumes",
+            Prune::BuildCache => return Ok(()),
+        };
+        let path = format!("/{collection}/{}", encode(target));
+        let res = http::request(&self.sock, "DELETE", &path, None, SLOW)
+            .map_err(|e| format!("Cannot reach the Docker engine: {e}"))?;
+        // Already gone is what was asked for.
+        if res.status >= 400 && res.status != 404 {
+            return Err(api_error(res.status, &res.body));
+        }
+        Ok(())
+    }
+
+    /// Empties the build cache and returns the bytes the engine says it freed.
+    /// This is the one prune left to the engine: its entries have no names to
+    /// list, and they can always be built again.
+    pub fn clear_build_cache(&self) -> DResult<i64> {
         #[derive(serde::Deserialize, Default)]
         #[serde(rename_all = "PascalCase", default)]
         struct Report {
             space_reclaimed: i64,
         }
-        let path = match kind {
-            Prune::Containers => "/containers/prune".to_string(),
-            // Without these filters, images keep their tags and named volumes stay.
-            Prune::Images => format!("/images/prune?filters={}", encode(r#"{"dangling":["false"]}"#)),
-            Prune::Volumes => format!("/volumes/prune?filters={}", encode(r#"{"all":["true"]}"#)),
-            Prune::BuildCache => "/build/prune?all=1".to_string(),
-        };
-        let body = self.call("POST", &path, SLOW)?;
+        let path = "/build/prune?all=1";
+        let body = self.call("POST", path, SLOW)?;
         let report: Report = serde_json::from_slice(&body).map_err(|e| format!("Unexpected reply from {path}: {e}"))?;
         Ok(report.space_reclaimed)
     }
 
-    /// What pruning `kind` would remove right now, for the confirmation. The
-    /// engine decides afresh when it prunes, so this shows, it does not promise.
+    /// What pruning `kind` would remove right now, for the confirmation.
     pub fn prune_preview(&self, kind: Prune) -> DResult<PrunePreview> {
         let only = match kind {
             Prune::Containers => "container",
@@ -416,23 +439,98 @@ pub fn shared_with_vm(path: &Path, home: &Path) -> bool {
     path.starts_with(home)
 }
 
+/// What the Run dialog asks for. Ports, env and volumes are lists separated by
+/// spaces, so a value cannot hold one. That covers nearly all of them, and
+/// anything else belongs on the command line.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RunForm {
+    pub image: String,
+    pub name: String,
+    pub ports: String,
+    pub env: String,
+    pub volumes: String,
+}
+
+/// The arguments for `docker`, or what is wrong with the form. A leading `-`
+/// would be read as an option, and `KEY` alone would pass on the app's own value.
+pub fn run_args(form: &RunForm, home: Option<&Path>) -> DResult<Vec<String>> {
+    let (image, name) = (form.image.trim(), form.name.trim());
+    if image.is_empty() || image.starts_with('-') {
+        return Err("Enter an image to run, such as nginx:alpine.".to_string());
+    }
+    if name.starts_with('-') {
+        return Err(format!("{name} is not a container name."));
+    }
+    let mut args: Vec<String> = ["run", "-d"].map(String::from).into();
+    if !name.is_empty() {
+        args.extend(["--name".to_string(), name.to_string()]);
+    }
+    for port in form.ports.split_whitespace() {
+        args.extend(["-p".to_string(), port.to_string()]);
+    }
+    for variable in form.env.split_whitespace() {
+        if !variable.contains('=') {
+            return Err(format!("{variable} is not KEY=value."));
+        }
+        args.extend(["-e".to_string(), variable.to_string()]);
+    }
+    for volume in form.volumes.split_whitespace() {
+        args.extend(["-v".to_string(), expand_home(volume, home)]);
+    }
+    args.push(image.to_string());
+    Ok(args)
+}
+
+fn expand_home(volume: &str, home: Option<&Path>) -> String {
+    match (volume.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest).display().to_string(),
+        _ => volume.to_string(),
+    }
+}
+
+/// The host folders in a form that the VM cannot see.
+pub fn unshared_mounts(form: &RunForm, home: &Path) -> Vec<String> {
+    form.volumes
+        .split_whitespace()
+        .map(|volume| expand_home(volume, Some(home)))
+        .filter_map(|volume| volume.split(':').next().map(String::from))
+        .filter(|source| source.starts_with('/') && !shared_with_vm(Path::new(source), home))
+        .collect()
+}
+
+pub fn run_image(socket: &Path, args: &[String]) -> DResult<()> {
+    let Some(docker) = find_tool("docker") else {
+        return Err("Running an image needs the Docker command line. Install it with: brew install docker".to_string());
+    };
+    run_cli(Command::new(docker), socket, args, "docker run failed")
+}
+
 fn run_compose(socket: &Path, args: &[OsString]) -> DResult<()> {
-    let Some(mut command) = compose_command(find_tool("docker"), find_tool("docker-compose")) else {
+    let Some(command) = compose_command(find_tool("docker"), find_tool("docker-compose")) else {
         return Err("Project actions need Docker Compose. Install it with: brew install docker docker-compose".to_string());
     };
+    run_cli(command, socket, args, "docker compose failed")
+}
+
+/// Runs a Docker tool against this engine. Its last line of errors is the reason.
+fn run_cli(mut command: Command, socket: &Path, args: &[impl AsRef<std::ffi::OsStr>], fallback: &str) -> DResult<()> {
     let output = command
         .args(args)
         .env("DOCKER_HOST", format!("unix://{}", socket.display()))
         .env("PATH", search_path())
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("Could not run Docker Compose: {e}"))?;
+        .map_err(|e| format!("Could not run {}: {e}", command.get_program().to_string_lossy()))?;
     if output.status.success() {
         return Ok(());
     }
-    let text = String::from_utf8_lossy(&output.stderr);
-    let reason = text.lines().rfind(|line| !line.trim().is_empty()).unwrap_or("docker compose failed");
-    Err(reason.trim().to_string())
+    Err(failure_reason(&String::from_utf8_lossy(&output.stderr)).unwrap_or(fallback).to_string())
+}
+
+/// The last line that says something. `docker run` ends on a pointer to its help.
+fn failure_reason(text: &str) -> Option<&str> {
+    let line = text.lines().map(str::trim).rfind(|line| !line.is_empty() && !line.starts_with("Run 'docker"))?;
+    Some(line.strip_prefix("docker: ").unwrap_or(line))
 }
 
 /// The `docker compose` plugin, or else the plain `docker-compose` binary: Docker
@@ -649,7 +747,91 @@ mod tests {
             _ => ("404 Not Found", r#"{"message":"wrong path"}"#),
         });
         let preview = Docker::new(&sock).prune_preview(Prune::Volumes).unwrap();
-        assert_eq!(preview.items, [("data".to_string(), Some(500))]);
+        assert_eq!(preview.items[0].name, "data");
+        assert_eq!(preview.items[0].size, Some(500));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_form_becomes_docker_run_arguments() {
+        let form = RunForm {
+            image: " nginx:alpine ".into(),
+            name: "web".into(),
+            ports: "8080:80  8443:443".into(),
+            env: "MODE=dev DSN=a=b".into(),
+            volumes: "data:/data ~/site:/srv".into(),
+        };
+        let args = run_args(&form, Some(Path::new("/Users/a"))).unwrap();
+        assert_eq!(args.join(" "), "run -d --name web -p 8080:80 -p 8443:443 -e MODE=dev -e DSN=a=b \
+                                    -v data:/data -v /Users/a/site:/srv nginx:alpine");
+        let bare = RunForm { image: "alpine".into(), ..Default::default() };
+        assert_eq!(run_args(&bare, None).unwrap(), ["run", "-d", "alpine"]);
+    }
+
+    #[test]
+    fn a_run_form_that_cannot_work_says_why() {
+        let form = |image: &str, name: &str, env: &str| RunForm {
+            image: image.into(),
+            name: name.into(),
+            env: env.into(),
+            ..Default::default()
+        };
+        assert!(run_args(&form("  ", "", ""), None).unwrap_err().contains("Enter an image"));
+        assert!(run_args(&form("--privileged", "", ""), None).is_err());
+        assert!(run_args(&form("alpine", "-x", ""), None).is_err());
+        assert_eq!(run_args(&form("alpine", "", "SECRET"), None).unwrap_err(), "SECRET is not KEY=value.");
+    }
+
+    #[test]
+    fn a_failure_gives_the_reason_not_the_help_pointer() {
+        let text = "docker: Error response from daemon: name is in use\n\nRun 'docker run --help' for more information\n";
+        assert_eq!(failure_reason(text), Some("Error response from daemon: name is in use"));
+        assert_eq!(failure_reason("no such service: web\n"), Some("no such service: web"));
+        assert_eq!(failure_reason("\n"), None);
+    }
+
+    #[test]
+    fn only_host_folders_outside_home_are_flagged() {
+        let form = RunForm { volumes: "data:/d ~/ok:/o /Users/a/fine:/f /opt/x:/x /tmp/y:/y:ro".into(), ..Default::default() };
+        assert_eq!(unshared_mounts(&form, Path::new("/Users/a")), ["/opt/x", "/tmp/y"]);
+    }
+
+    #[test]
+    fn only_what_was_listed_is_removed() {
+        static ASKED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let (dir, sock) = fake_engine("listed", |path| {
+            ASKED.lock().unwrap().push(path.to_string());
+            match path {
+                "/volumes/gone" => ("404 Not Found", r#"{"message":"no such volume"}"#),
+                "/volumes/busy" => ("409 Conflict", r#"{"message":"volume is in use"}"#),
+                _ => ("204 No Content", ""),
+            }
+        });
+        let item = |name: &str| PruneItem { name: name.into(), size: None, targets: vec![name.into()] };
+        let items = [item("data"), item("gone"), item("busy")];
+
+        let refused = Docker::new(&sock).remove_listed(Prune::Volumes, &items);
+
+        assert_eq!(refused, [("busy".to_string(), "volume is in use".to_string())]);
+        let asked = ASKED.lock().unwrap();
+        assert_eq!(*asked, ["/volumes/data", "/volumes/gone", "/volumes/busy", "/volumes/busy"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_image_can_wait_for_the_ones_built_on_it() {
+        static PARENT_TRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let (dir, sock) = fake_engine("listed-images", |path| match path {
+            "/images/parent" if PARENT_TRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 => {
+                ("409 Conflict", r#"{"message":"image has dependent child images"}"#)
+            }
+            _ => ("200 OK", "[]"),
+        });
+        let item = |name: &str| PruneItem { name: name.into(), size: None, targets: vec![name.into()] };
+
+        let refused = Docker::new(&sock).remove_listed(Prune::Images, &[item("parent"), item("child")]);
+
+        assert!(refused.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

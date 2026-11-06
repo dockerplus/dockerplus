@@ -26,25 +26,33 @@ fi
 
 scripts/bundle.sh
 
-# Quitting the app leaves Colima and its containers running.
-if pgrep -qf "$RUNNING"; then
-    osascript -e 'tell application "DockerPlus" to quit' >/dev/null 2>&1 || true
-    for _ in {1..40}; do
-        pgrep -qf "$RUNNING" || break
-        sleep 0.25
-    done
-    if pgrep -qf "$RUNNING"; then
-        fail "DockerPlus is still open. Quit it, then run this again."
-    fi
-fi
-
 apps=/Applications
 if [ ! -w "$apps" ]; then
     apps=$HOME/Applications
     mkdir -p "$apps"
 fi
-rm -rf "$apps/DockerPlus.app"
-ditto target/DockerPlus.app "$apps/DockerPlus.app"
+
+# Copied beside the old app first, so a full disk or Ctrl-C leaves that one in place.
+new="$apps/.DockerPlus.app.new"
+old="$apps/.DockerPlus.app.old"
+trap 'rm -rf "$new"' EXIT
+rm -rf "$new" "$old"
+ditto target/DockerPlus.app "$new"
+
+# Left to the user. Asking the app to quit raises an Automation prompt in
+# Terminal, and killing it could cut off a Colima start it is running.
+if pgrep -qf "$RUNNING"; then
+    echo "Quit DockerPlus to finish installing. Colima keeps running."
+    while pgrep -qf "$RUNNING"; do
+        sleep 0.25
+    done
+fi
+
+if [ -e "$apps/DockerPlus.app" ]; then
+    mv "$apps/DockerPlus.app" "$old"
+fi
+mv "$new" "$apps/DockerPlus.app"
+rm -rf "$old"
 
 # Homebrew's bin folder is already on PATH. The link points into the app, so the
 # command keeps working if this source folder moves or goes away.
