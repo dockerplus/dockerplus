@@ -44,6 +44,7 @@ pub fn container(mtm: MainThreadMarker, content: &NSView, spacing: f64) -> Retai
 /// A push button drawn in glass, optionally tinted as the primary action.
 pub fn button(button: &NSButton, prominent: bool) {
     button.setBezelStyle(NSBezelStyle::Glass);
+    button.setBorderShape(NSControlBorderShape::Capsule);
     if prominent {
         button.setTintProminence(NSTintProminence::Primary);
     }

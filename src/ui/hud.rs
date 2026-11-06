@@ -14,11 +14,10 @@ const CAPSULE_HEIGHT: f64 = 32.0;
 /// Room the tables keep clear so their last row can scroll past the capsules.
 pub const HUD_CLEARANCE: f64 = 50.0;
 
-/// Two capsules in a glass container. They sit above scrolling content, which
-/// is the one place custom glass belongs, and merge as the activity one appears.
+/// Capsules in a glass container, shown only while there is something to report.
+/// They sit above scrolling content, which is the one place custom glass belongs.
 pub struct Hud {
     pub view: Retained<NSGlassEffectContainerView>,
-    summary: Retained<NSTextField>,
     activity: Retained<NSTextField>,
     activity_capsule: Retained<NSGlassEffectView>,
     spinner: Retained<NSProgressIndicator>,
@@ -28,9 +27,6 @@ pub struct Hud {
 
 impl Hud {
     pub fn new(mtm: MainThreadMarker) -> Self {
-        let summary = label(mtm, "", 12.0, unsafe { NSFontWeightMedium });
-        let summary_capsule = glass::capsule(mtm, &padded(mtm, &[&summary]), CAPSULE_HEIGHT / 2.0, false);
-
         let spinner = NSProgressIndicator::new(mtm);
         spinner.setStyle(NSProgressIndicatorStyle::Spinning);
         spinner.setControlSize(NSControlSize::Small);
@@ -43,16 +39,12 @@ impl Hud {
         let stats_capsule = glass::capsule(mtm, &padded(mtm, &[&stats]), CAPSULE_HEIGHT / 2.0, false);
         stats_capsule.setHidden(true);
 
-        let row = hstack(mtm, 8.0, &[&summary_capsule, &stats_capsule, &activity_capsule]);
+        let row = hstack(mtm, 8.0, &[&stats_capsule, &activity_capsule]);
         let view = glass::container(mtm, &row, 16.0);
-        for capsule in [&summary_capsule, &stats_capsule, &activity_capsule] {
+        for capsule in [&stats_capsule, &activity_capsule] {
             activate(&[capsule.heightAnchor().constraintEqualToConstant(CAPSULE_HEIGHT)]);
         }
-        Self { view, summary, activity, activity_capsule, spinner, stats, stats_capsule }
-    }
-
-    pub fn set_summary(&self, text: &str) {
-        self.summary.setStringValue(&ns(text));
+        Self { view, activity, activity_capsule, spinner, stats, stats_capsule }
     }
 
     pub fn set_stats(&self, text: Option<&str>) {
@@ -74,9 +66,9 @@ impl Hud {
     }
 
     #[cfg(feature = "devtools")]
-    pub fn text(&self) -> (String, String, String) {
+    pub fn text(&self) -> (String, String) {
         let stats = if self.stats_capsule.isHidden() { String::new() } else { self.stats.stringValue().to_string() };
-        (self.summary.stringValue().to_string(), self.activity.stringValue().to_string(), stats)
+        (self.activity.stringValue().to_string(), stats)
     }
 }
 

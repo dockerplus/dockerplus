@@ -341,9 +341,9 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
     empty.view.setTranslatesAutoresizingMaskIntoConstraints(false);
     hud.view.setTranslatesAutoresizingMaskIntoConstraints(false);
     activate(&[
-        empty.view.centerXAnchor().constraintEqualToAnchor(&pages_view.centerXAnchor()),
+        empty.view.centerXAnchor().constraintEqualToAnchor(&pages_view.safeAreaLayoutGuide().centerXAnchor()),
         empty.view.centerYAnchor().constraintEqualToAnchor(&pages_view.centerYAnchor()),
-        hud.view.centerXAnchor().constraintEqualToAnchor(&pages_view.centerXAnchor()),
+        hud.view.centerXAnchor().constraintEqualToAnchor(&pages_view.safeAreaLayoutGuide().centerXAnchor()),
         hud.view.bottomAnchor().constraintEqualToAnchor_constant(&pages_view.bottomAnchor(), -12.0),
     ]);
 
@@ -370,6 +370,9 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
     detail_vc.setView(&detail);
     let detail_item = NSSplitViewItem::splitViewItemWithViewController(&detail_vc);
     detail_item.setMinimumThickness(560.0);
+    // Lets the content run under the sidebar, which is what the glass refracts.
+    // Without it the sidebar sits beside the content as a flat panel.
+    detail_item.setAutomaticallyAdjustsSafeAreaInsets(true);
 
     let split = NSSplitViewController::new(mtm);
     split.addSplitViewItem(&sidebar_item);
@@ -947,11 +950,10 @@ impl Controller {
         };
         self.sidebar.set_status(StatusView { title: title.to_string(), detail, dot, busy, button });
 
-        let version = if info.version.is_empty() { String::new() } else { format!("Colima {}", info.version) };
         let headline = match phase {
             Phase::NotInstalled => "Colima is not installed. Run: brew install colima".to_string(),
             Phase::Stopped if !info.provisioned => "No virtual machine yet. The first start downloads one.".to_string(),
-            _ => version,
+            _ => String::new(),
         };
         let memory_in_use = st.vm_usage.memory.map(|(used, total)| pages::vm_usage_text(used, total));
         let disk_in_use = st.vm_usage.disk.map(|(used, total)| pages::vm_usage_text(used, total));
@@ -1006,7 +1008,6 @@ impl Controller {
         };
         self.window.setTitle(&ns(page.title()));
         self.window.setSubtitle(&ns(if up { &summary } else { "" }));
-        self.hud.set_summary(&summary);
 
         let activity = st.pull.as_ref().map(|text| format!("Pull: {text}")).or_else(|| {
             (st.busy_actions > 0).then(|| "Working…".to_string())
@@ -1301,7 +1302,7 @@ impl Controller {
             }
             st.op = Some(op);
         }
-        clear_text(&self.colima_page.console);
+        self.colima_page.clear_output();
         self.render_chrome();
         let on_line = |line| post(Msg::CliLine(line));
         thread::spawn(move || {
@@ -1445,7 +1446,7 @@ impl Controller {
         unsafe { NSUserDefaults::standardUserDefaults().setObject_forKey(Some(&ns(name)), &ns(PROFILE_KEY)) };
         *self.docker.lock().unwrap() = Docker::new(Colima::default_socket(name));
         self.close_logs();
-        clear_text(&self.colima_page.console);
+        self.colima_page.clear_output();
         self.reconnect_engine();
         self.reload_colima();
         self.sync_sampler();

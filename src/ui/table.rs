@@ -368,11 +368,10 @@ impl Table {
         let ctl: Retained<TableCtl> = unsafe { msg_send![super(ctl), init] };
 
         let view = NSTableView::new(mtm);
-        view.setStyle(NSTableViewStyle::FullWidth);
+        view.setStyle(NSTableViewStyle::Inset);
         view.setRowSizeStyle(NSTableViewRowSizeStyle::Custom);
         view.setRowHeight(ROW_HEIGHT);
         view.setIntercellSpacing(NSSize::new(6.0, 0.0));
-        view.setUsesAlternatingRowBackgroundColors(true);
         view.setAllowsMultipleSelection(true);
         view.setAllowsColumnReordering(false);
         view.setColumnAutoresizingStyle(NSTableViewColumnAutoresizingStyle::LastColumnOnlyAutoresizingStyle);

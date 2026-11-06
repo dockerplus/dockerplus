@@ -12,11 +12,9 @@ use objc2_app_kit::*;
 use objc2_foundation::*;
 use std::cell::RefCell;
 
-const KEY_COLUMN_WIDTH: f64 = 110.0;
-const FIELDS: [&str; 11] = [
-    "Status", "CPU", "Memory", "Memory in use", "Disk", "Disk in use", "Runtime", "Virtual machine", "Mount",
-    "Docker engine", "Docker socket",
-];
+const CARD_RADIUS: f64 = 12.0;
+const RESOURCE_FIELDS: [&str; 6] = ["Status", "CPU", "Memory", "Memory in use", "Disk", "Disk in use"];
+const ENGINE_FIELDS: [&str; 6] = ["Colima", "Runtime", "Virtual machine", "Mount", "Docker engine", "Docker socket"];
 
 /// What the profile menu was just used for.
 pub enum ProfilePick {
@@ -33,6 +31,8 @@ pub struct ColimaPage {
     /// rebuilding would disturb a menu someone has open.
     profiles: RefCell<Vec<String>>,
     values: Vec<Retained<NSTextField>>,
+    output: Retained<NSTextField>,
+    frame: Retained<NSBox>,
     pub start: Retained<NSButton>,
     pub stop: Retained<NSButton>,
     pub restart: Retained<NSButton>,
@@ -58,56 +58,53 @@ impl ColimaPage {
         let stop = action_button(mtm, actions, "Stop", "stop.fill", Action::ColimaStop);
         let restart = action_button(mtm, actions, "Restart", "arrow.clockwise", Action::ColimaRestart);
         let resources = action_button(mtm, actions, "VM Settings…", "slider.horizontal.3", Action::ColimaResources);
+        glass::button(&profile, false);
         glass::button(&start, true);
         glass::button(&stop, false);
         glass::button(&restart, false);
         glass::button(&resources, false);
         let buttons = hstack(mtm, 8.0, &[&start, &stop, &restart, &resources]);
 
-        let grid = NSGridView::gridViewWithNumberOfColumns_rows(2, 0, mtm);
-        grid.setRowSpacing(7.0);
-        grid.setColumnSpacing(16.0);
         let mut values = Vec::new();
-        for field in FIELDS {
-            let key = secondary_label(mtm, field, 12.0);
-            let value = label(mtm, "—", 12.0, unsafe { NSFontWeightRegular });
-            value.setSelectable(true);
-            let row: [&NSView; 2] = [&key, &value];
-            grid.addRowWithViews(&NSArray::from_slice(&row));
-            values.push(value);
-        }
-        let keys = grid.columnAtIndex(0);
-        keys.setXPlacement(NSGridCellPlacement::Trailing);
-        // A fixed width, or this column takes all the spare room and pushes the
-        // values to the far edge of the window.
-        keys.setWidth(KEY_COLUMN_WIDTH);
-        grid.columnAtIndex(1).setXPlacement(NSGridCellPlacement::Leading);
+        let resources_card = card(mtm, &RESOURCE_FIELDS, &mut values);
+        let engine_card = card(mtm, &ENGINE_FIELDS, &mut values);
+        let cards = hstack(mtm, 12.0, &[&resources_card, &engine_card]);
+        cards.setDistribution(NSStackViewDistribution::FillEqually);
+        cards.setAlignment(NSLayoutAttribute::Top);
 
         let output = secondary_label(mtm, "Output", 12.0);
         let (scroll, console_text) = console(mtm);
-        console_text.setTextContainerInset(NSSize::new(6.0, 6.0));
+        console_text.setTextContainerInset(NSSize::new(8.0, 8.0));
         let frame = NSBox::new(mtm);
         frame.setBoxType(NSBoxType::Custom);
-        frame.setCornerRadius(8.0);
-        frame.setBorderColor(&NSColor::separatorColor());
-        frame.setFillColor(&NSColor::controlBackgroundColor());
+        frame.setCornerRadius(CARD_RADIUS);
+        frame.setBorderWidth(0.0);
+        frame.setFillColor(&NSColor::quaternarySystemFillColor());
         frame.setContentViewMargins(NSSize::ZERO);
         frame.setContentView(Some(&scroll));
         frame.setContentHuggingPriority_forOrientation(1.0, NSLayoutConstraintOrientation::Vertical);
         frame.setContentCompressionResistancePriority_forOrientation(200.0, NSLayoutConstraintOrientation::Vertical);
+        // Nothing to show until Colima has said something.
+        output.setHidden(true);
+        frame.setHidden(true);
 
-        let stack = vstack(mtm, 6.0, &[&header, &buttons, &grid, &output, &frame]);
+        let stack = vstack(mtm, 6.0, &[&header, &buttons, &cards, &output, &frame]);
         stack.setCustomSpacing_afterView(14.0, &header);
         stack.setCustomSpacing_afterView(20.0, &buttons);
-        stack.setCustomSpacing_afterView(20.0, &grid);
+        stack.setCustomSpacing_afterView(20.0, &cards);
         view.addSubview(&stack);
         stack.setTranslatesAutoresizingMaskIntoConstraints(false);
         let safe = view.safeAreaLayoutGuide();
+        // Weak, so the cards stay at the top while there is no output to fill the rest.
+        let fill = stack.bottomAnchor().constraintEqualToAnchor_constant(&view.bottomAnchor(), -18.0);
+        fill.setPriority(240.0);
         activate(&[
+            fill,
             stack.topAnchor().constraintEqualToAnchor_constant(&safe.topAnchor(), 16.0),
-            stack.bottomAnchor().constraintEqualToAnchor_constant(&view.bottomAnchor(), -18.0),
-            stack.leadingAnchor().constraintEqualToAnchor_constant(&view.leadingAnchor(), 24.0),
-            stack.trailingAnchor().constraintEqualToAnchor_constant(&view.trailingAnchor(), -24.0),
+            stack.bottomAnchor().constraintLessThanOrEqualToAnchor_constant(&view.bottomAnchor(), -18.0),
+            stack.leadingAnchor().constraintEqualToAnchor_constant(&safe.leadingAnchor(), 24.0),
+            stack.trailingAnchor().constraintEqualToAnchor_constant(&safe.trailingAnchor(), -24.0),
+            cards.trailingAnchor().constraintEqualToAnchor(&stack.trailingAnchor()),
             frame.trailingAnchor().constraintEqualToAnchor(&stack.trailingAnchor()),
             frame.heightAnchor().constraintGreaterThanOrEqualToConstant(90.0),
         ]);
@@ -118,6 +115,8 @@ impl ColimaPage {
             profile,
             profiles: RefCell::default(),
             values,
+            output,
+            frame,
             start,
             stop,
             restart,
@@ -182,18 +181,68 @@ impl ColimaPage {
         let docker = engine.map(|e| format!("{} (API {}, kernel {})", e.version, e.api_version, e.kernel_version));
         let socket = live.map(|s| s.docker_socket.trim_start_matches("unix://").to_string());
 
-        let entries =
-            [Some(status.to_string()), cpu, memory, memory_in_use, disk, disk_in_use, runtime, vm, mount, docker, socket];
+        let entries = [
+            Some(status.to_string()), cpu, memory, memory_in_use, disk, disk_in_use,
+            Some(info.version.clone()), runtime, vm, mount, docker, socket,
+        ];
         for (field, value) in self.values.iter().zip(entries) {
             let value = value.filter(|v| !v.is_empty()).unwrap_or_else(|| "—".into());
             field.setStringValue(&ns(&value));
+            // Long values are cut in the middle to fit their card.
+            field.setToolTip(Some(&ns(&value)));
         }
     }
 
+    pub fn clear_output(&self) {
+        clear_text(&self.console);
+        self.output.setHidden(true);
+        self.frame.setHidden(true);
+    }
+
     pub fn log_line(&self, line: &str) {
+        self.output.setHidden(false);
+        self.frame.setHidden(false);
         append_text(&self.console, &format!("{line}\n"));
         scroll_to_end(&self.console);
     }
+}
+
+/// Rows of label and value in a rounded group, as System Settings draws them.
+/// Cards are content, so they stay plain: glass is for what floats above it.
+fn card(mtm: MainThreadMarker, fields: &[&str], values: &mut Vec<Retained<NSTextField>>) -> Retained<NSView> {
+    let rows = vstack(mtm, 0.0, &[]);
+    rows.setAlignment(NSLayoutAttribute::CenterX);
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            let line = NSBox::new(mtm);
+            line.setBoxType(NSBoxType::Separator);
+            rows.addArrangedSubview(&line);
+            activate(&[line.widthAnchor().constraintEqualToAnchor_constant(&rows.widthAnchor(), -28.0)]);
+        }
+        let key = secondary_label(mtm, field, 12.0);
+        let value = label(mtm, "—", 12.0, unsafe { NSFontWeightRegular });
+        value.setSelectable(true);
+        value.setAlignment(NSTextAlignment::Right);
+        value.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+        value.setContentHuggingPriority_forOrientation(1.0, NSLayoutConstraintOrientation::Horizontal);
+        value.setContentCompressionResistancePriority_forOrientation(200.0, NSLayoutConstraintOrientation::Horizontal);
+        let row = hstack(mtm, 12.0, &[&key, &value]);
+        row.setEdgeInsets(NSEdgeInsets { top: 7.0, left: 14.0, bottom: 7.0, right: 14.0 });
+        rows.addArrangedSubview(&row);
+        activate(&[row.widthAnchor().constraintEqualToAnchor(&rows.widthAnchor())]);
+        values.push(value);
+    }
+    let fill = NSBox::new(mtm);
+    fill.setBoxType(NSBoxType::Custom);
+    fill.setCornerRadius(CARD_RADIUS);
+    fill.setBorderWidth(0.0);
+    fill.setFillColor(&NSColor::quaternarySystemFillColor());
+    let holder = NSView::new(mtm);
+    holder.addSubview(&fill);
+    holder.addSubview(&rows);
+    pin(&fill, &holder);
+    pin(&rows, &holder);
+    holder
 }
 
 fn action_button(

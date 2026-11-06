@@ -225,7 +225,7 @@ impl Controller {
 
     fn dev_state(&self) -> String {
         let st = self.st.borrow();
-        let (summary, activity, stats) = self.hud.text();
+        let (activity, stats) = self.hud.text();
         let mut enabled = serde_json::Map::new();
         for name in [
             "ContainerStart", "ContainerStop", "ContainerRestart", "ShowLogs", "Pull", "Remove", "RunningOnly",
@@ -249,7 +249,7 @@ impl Controller {
             "volumes": st.volumes.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
             "networks": st.networks.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
             "selected": self.dev_table().map(Table::selected_keys),
-            "hud": {"summary": summary, "activity": activity, "stats": stats},
+            "hud": {"activity": activity, "stats": stats},
             "stats_on": st.stats_on,
             "toolbar": enabled,
             "logs_visible": !self.logs.view.isHidden(),
