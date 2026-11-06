@@ -208,14 +208,21 @@ impl TableCtl {
         let selected = self.selected_keys();
         *self.ivars().rows.borrow_mut() = next;
         table.reloadData();
+        self.select(&selected);
+    }
 
+    /// Selects the rows with these keys that are on screen, and no others.
+    /// Returns how many that was.
+    fn select(&self, keys: &[String]) -> usize {
+        let Some(table) = self.ivars().table.get() else { return 0 };
         let indexes = NSMutableIndexSet::new();
         for (index, row) in self.ivars().rows.borrow().iter().enumerate() {
-            if selected.contains(&row.key) {
+            if keys.contains(&row.key) {
                 indexes.addIndex(index);
             }
         }
         table.selectRowIndexes_byExtendingSelection(&indexes, false);
+        indexes.count()
     }
 
     fn selected_keys(&self) -> Vec<String> {
@@ -273,6 +280,7 @@ fn make_cell(identifier: &NSString, spec: Column, mtm: MainThreadMarker) -> Reta
 
 pub struct Table {
     pub ctl: Retained<TableCtl>,
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     pub view: Retained<NSTableView>,
     pub scroll: Retained<NSScrollView>,
 }
@@ -364,21 +372,21 @@ impl Table {
         self.ctl.selected_keys()
     }
 
-    /// Selects the rows with these keys that are on screen, and no others.
-    pub fn select_keys(&self, keys: &[String]) {
-        let indexes = NSMutableIndexSet::new();
-        for (index, row) in self.ctl.ivars().rows.borrow().iter().enumerate() {
-            if keys.contains(&row.key) {
-                indexes.addIndex(index);
-            }
-        }
-        self.view.selectRowIndexes_byExtendingSelection(&indexes, false);
+    /// Selects the rows with these keys that are on screen, returning how many.
+    pub fn select_keys(&self, keys: &[String]) -> usize {
+        self.ctl.select(keys)
     }
 
     #[cfg(feature = "devtools")]
     pub fn visible_text(&self) -> Vec<Vec<String>> {
         let rows = self.ctl.ivars().rows.borrow();
         rows.iter().map(|r| r.cells.iter().map(|c| c.text.clone()).collect()).collect()
+    }
+
+    #[cfg(feature = "devtools")]
+    pub fn index_of(&self, needle: &str) -> Option<usize> {
+        let rows = self.ctl.ivars().rows.borrow();
+        rows.iter().position(|row| row.key.contains(needle) || row.cells.iter().any(|cell| cell.text == needle))
     }
 
     #[cfg(feature = "devtools")]

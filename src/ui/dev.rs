@@ -111,6 +111,38 @@ impl Controller {
                     _ => "bad sort".into(),
                 }
             }
+            "front" => {
+                let app = NSApplication::sharedApplication(self.mtm);
+                #[allow(deprecated)]
+                app.activateIgnoringOtherApps(true);
+                self.window.makeKeyAndOrderFront(None);
+                format!("active={} key={}", app.isActive(), self.window.isKeyWindow())
+            }
+            "key" => self.dev_key(argument),
+            "clickrow" => self.dev_click_row(argument),
+            "clicksidebar" => self.dev_click_sidebar(argument),
+            "clickheader" => self.dev_click_header(argument),
+            "clickbutton" => self.dev_click_button(argument),
+            "clicktool" => self.dev_click_tool(argument),
+            "rightclick" => self.dev_right_click(argument),
+            "sortstate" => self.dev_table().map_or("no table".into(), |table| {
+                table.view.sortDescriptors().iter().map(|d| {
+                    format!("{}:{}", d.key().map_or(String::new(), |k| k.to_string()), d.ascending())
+                }).collect::<Vec<_>>().join(",")
+            }),
+            "fileicon" => {
+                let (from, to) = argument.split_once(' ').unwrap_or((argument, ""));
+                let icon = NSWorkspace::sharedWorkspace().iconForFile(&ns(from));
+                icon.setSize(NSSize::new(512.0, 512.0));
+                match icon.TIFFRepresentation().and_then(|tiff| NSBitmapImageRep::imageRepWithData(&tiff)) {
+                    Some(rep) => {
+                        let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) };
+                        png.map_or("no png".into(), |d| d.writeToFile_atomically(&ns(to), true).to_string())
+                    }
+                    None => "no image".into(),
+                }
+            }
+            "responder" => self.window.firstResponder().map_or("none".into(), |r| r.class().name().to_string_lossy().to_string()),
             "modal" => self.dev_modal(argument),
             "close" => {
                 self.window.performClose(None);
@@ -131,6 +163,7 @@ impl Controller {
                 "ok".into()
             }),
             "logs" => self.logs.text.string().to_string(),
+            "loglast" => self.logs.text.string().to_string().lines().last().unwrap_or("").to_string(),
             "console" => self.colima_page.console.string().to_string(),
             "menu" => self.dev_menu(),
             "menupick" => self.dev_menu_pick(argument),
@@ -333,6 +366,141 @@ impl Controller {
         }
     }
 
+    // Synthetic input. These build real NSEvents and hand them to `NSApp
+    // sendEvent:`, so menu key equivalents, hit testing, click counts and table
+    // tracking all run as usual. Only the hardware and WindowServer are skipped.
+
+    fn dev_event(&self, kind: NSEventType, at: NSPoint, clicks: NSInteger) -> Retained<NSEvent> {
+        NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            kind,
+            at,
+            NSEventModifierFlags::empty(),
+            NSProcessInfo::processInfo().systemUptime(),
+            self.window.windowNumber(),
+            None,
+            0,
+            clicks,
+            1.0,
+        )
+        .expect("mouse event")
+    }
+
+    /// Queues the mouse-up first, because controls track the mouse in a loop
+    /// inside `mouseDown:` and would otherwise wait for it forever.
+    fn dev_click_at(&self, at: NSPoint, count: NSInteger) {
+        let app = NSApplication::sharedApplication(self.mtm);
+        for click in 1..=count {
+            app.postEvent_atStart(&self.dev_event(NSEventType::LeftMouseUp, at, click), true);
+            app.sendEvent(&self.dev_event(NSEventType::LeftMouseDown, at, click));
+        }
+    }
+
+    fn dev_key(&self, spec: &str) -> String {
+        let mut parts: Vec<&str> = spec.split('+').collect();
+        let Some(key) = parts.pop() else { return "no key".into() };
+        let mut flags = NSEventModifierFlags::empty();
+        for part in parts {
+            flags |= match part {
+                "cmd" => NSEventModifierFlags::Command,
+                "shift" => NSEventModifierFlags::Shift,
+                "ctrl" => NSEventModifierFlags::Control,
+                "opt" => NSEventModifierFlags::Option,
+                _ => return format!("unknown modifier {part}"),
+            };
+        }
+        let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+            NSEventType::KeyDown,
+            NSPoint::ZERO,
+            flags,
+            NSProcessInfo::processInfo().systemUptime(),
+            self.window.windowNumber(),
+            None,
+            &ns(key),
+            &ns(key),
+            false,
+            0,
+        )
+        .expect("key event");
+        NSApplication::sharedApplication(self.mtm).sendEvent(&event);
+        "sent".into()
+    }
+
+    fn dev_row_point(&self, needle: &str) -> Option<NSPoint> {
+        let table = self.dev_table()?;
+        let rect = table.view.rectOfRow(table.index_of(needle)? as NSInteger);
+        let center = NSPoint::new(rect.origin.x + 40.0, rect.origin.y + rect.size.height / 2.0);
+        Some(table.view.convertPoint_toView(center, None))
+    }
+
+    /// `clickrow <name> [count]`
+    fn dev_click_row(&self, argument: &str) -> String {
+        let (needle, count) = match argument.rsplit_once(' ') {
+            Some((needle, count)) if count.parse::<NSInteger>().is_ok() => (needle, count.parse().unwrap_or(1)),
+            _ => (argument, 1),
+        };
+        let Some(point) = self.dev_row_point(needle) else { return "no such row".into() };
+        self.dev_click_at(point, count);
+        "clicked".into()
+    }
+
+    fn dev_click_sidebar(&self, argument: &str) -> String {
+        let rect = self.sidebar.table.rectOfRow(argument.parse().unwrap_or(0));
+        let center = NSPoint::new(rect.origin.x + 40.0, rect.origin.y + rect.size.height / 2.0);
+        self.dev_click_at(self.sidebar.table.convertPoint_toView(center, None), 1);
+        "clicked".into()
+    }
+
+    fn dev_click_header(&self, argument: &str) -> String {
+        let Some(table) = self.dev_table() else { return "no table".into() };
+        let Some(header) = table.view.headerView() else { return "no header".into() };
+        let rect = header.headerRectOfColumn(argument.parse().unwrap_or(0));
+        let center = NSPoint::new(rect.origin.x + rect.size.width / 2.0, rect.origin.y + rect.size.height / 2.0);
+        self.dev_click_at(header.convertPoint_toView(center, None), 1);
+        "clicked".into()
+    }
+
+    fn dev_click_button(&self, name: &str) -> String {
+        let button = match name {
+            "colima-resources" => &self.colima_page.resources,
+            "colima-restart" => &self.colima_page.restart,
+            "sidebar" => &self.sidebar.button,
+            _ => return "no such button".into(),
+        };
+        let frame = button.bounds();
+        let center = NSPoint::new(frame.size.width / 2.0, frame.size.height / 2.0);
+        self.dev_click_at(button.convertPoint_toView(center, None), 1);
+        "clicked".into()
+    }
+
+    /// Clicks the nth visible toolbar item, counting from the left.
+    fn dev_click_tool(&self, argument: &str) -> String {
+        let Some(root) = self.window.contentView().and_then(|view| unsafe { view.superview() }) else {
+            return "no frame view".into();
+        };
+        let mut viewers = Vec::new();
+        collect_toolbar_viewers(&root, &mut viewers);
+        viewers.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let Some(index) = argument.parse::<usize>().ok() else {
+            return format!("{} items", viewers.len());
+        };
+        let Some((_, view)) = viewers.get(index) else { return "no such item".into() };
+        let frame = view.bounds();
+        let center = NSPoint::new(frame.size.width / 2.0, frame.size.height / 2.0);
+        self.dev_click_at(view.convertPoint_toView(center, None), 1);
+        "clicked".into()
+    }
+
+    /// Builds the menu for a real right-click, without opening the blocking
+    /// menu loop, and returns what ended up selected.
+    fn dev_right_click(&self, needle: &str) -> String {
+        let Some(point) = self.dev_row_point(needle) else { return "no such row".into() };
+        let table = &self.containers;
+        let event = self.dev_event(NSEventType::RightMouseDown, point, 1);
+        let Some(menu) = table.view.menuForEvent(&event) else { return "no menu".into() };
+        let _: () = unsafe { msg_send![&*table.ctl, menuNeedsUpdate: &*menu] };
+        json!({"selected": table.selected_keys().len(), "items": menu.numberOfItems()}).to_string()
+    }
+
     /// Like `sheet`, for an app-modal alert.
     fn dev_modal(&self, argument: &str) -> String {
         let app = NSApplication::sharedApplication(self.mtm);
@@ -399,6 +567,17 @@ impl Controller {
                 _ => "write failed".into(),
             }
         }
+    }
+}
+
+fn collect_toolbar_viewers(view: &NSView, out: &mut Vec<(f64, Retained<NSView>)>) {
+    for child in view.subviews().iter() {
+        let name = child.class().name().to_string_lossy().to_string();
+        if name.contains("ToolbarItemViewer") && !child.isHiddenOrHasHiddenAncestor() {
+            let at = child.convertPoint_toView(NSPoint::ZERO, None);
+            out.push((at.x, child.clone()));
+        }
+        collect_toolbar_viewers(&child, out);
     }
 }
 

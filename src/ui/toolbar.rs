@@ -174,7 +174,6 @@ impl Toolbar {
         }
     }
 
-    #[cfg(feature = "devtools")]
     pub fn set_search_text(&self, text: &str) {
         if let Some(item) = self.ctl.ivars().search.get() {
             item.searchField().setStringValue(&ns(text));

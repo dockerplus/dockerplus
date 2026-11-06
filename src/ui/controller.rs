@@ -10,7 +10,7 @@ use super::sidebar::{Sidebar, StatusView};
 use super::table::{Table, filter_rows};
 use super::toolbar::Toolbar;
 use super::util::*;
-use crate::backend::colima::{Colima, ColimaInfo, Resources, find_tool};
+use crate::backend::colima::{Colima, ColimaInfo, ResourceChange, Resources, find_tool};
 use crate::backend::docker::{ContainerAction, DResult, Docker, Snapshot, exec_script};
 use crate::backend::http::Cancel;
 use crate::backend::model::*;
@@ -35,12 +35,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const PROFILE: &str = "default";
 const LOG_TAIL: u32 = 1000;
 const LOG_PANEL_HEIGHT: f64 = 250.0;
-/// Text reaching AppKit is capped at one buffer per flush, about 1.3 MB/s. That
-/// is far beyond reading speed, and it keeps a runaway container from costing a
+/// Text reaching AppKit is capped at one buffer per flush, about 5 MB/s. That is
+/// far beyond reading speed, and it keeps a runaway container from costing a
 /// whole core.
-const LOG_BUFFER_LIMIT: usize = 128 * 1024;
+const LOG_BUFFER_LIMIT: usize = 512 * 1024;
 const LOG_FLUSH: Duration = Duration::from_millis(100);
 const LOG_BACKOFF: Duration = Duration::from_millis(15);
+/// How long the reader may wait on the text view before following is a lie: past
+/// this it gives up on the backlog and reconnects at the end of the log.
+const LOG_MAX_BEHIND: Duration = Duration::from_secs(2);
+const LOG_JUMP_TAIL: u32 = 200;
+const LOG_JUMP_NOTE: &[u8] = b"\n--- too much output to show it all: skipped ahead to the latest lines ---\n\n";
 /// Coalesces bursts of engine events, such as a `compose up`, into one refresh.
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(120);
 /// Keeps "Up 3 minutes" and relative dates from going stale without any events.
@@ -98,7 +103,7 @@ enum ColimaOp {
     Stop,
     Restart,
     /// Starts with a new size, stopping first when the VM is up.
-    Resize { resources: Resources, restart: bool },
+    Resize { change: ResourceChange, restart: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -614,8 +619,7 @@ impl Controller {
         self.colima_page.start.setEnabled(installed && idle && !up);
         self.colima_page.stop.setEnabled(installed && idle && up);
         self.colima_page.restart.setEnabled(installed && idle && up);
-        let sizable = matches!(phase, Phase::Stopped | Phase::Running | Phase::NoEngine);
-        self.colima_page.resources.setEnabled(installed && idle && sizable);
+        self.colima_page.resources.setEnabled(self.can(Action::ColimaResources));
 
         let (empty_title, empty_detail, show_start) = match phase {
             Phase::NotInstalled => ("Colima is not installed", "Install it with: brew install colima", false),
@@ -656,9 +660,9 @@ impl Controller {
     }
 
     fn render_toolbar(&self) {
-        let (page, up, running_only) = {
+        let (page, up) = {
             let st = self.st.borrow();
-            (st.page, st.engine_up, st.running_only)
+            (st.page, st.engine_up)
         };
         let containers = page == Page::Containers;
         for action in [
@@ -683,12 +687,6 @@ impl Controller {
             };
             self.toolbar.set(action, visible && up, self.can(action));
         }
-        let (icon, tip) = if running_only {
-            ("line.3.horizontal.decrease.circle.fill", "Showing running containers only")
-        } else {
-            ("line.3.horizontal.decrease.circle", "Show running containers only")
-        };
-        self.toolbar.set_icon(Action::RunningOnly, icon, tip);
         self.toolbar.set_search_visible(page != Page::Colima && up);
     }
 
@@ -709,9 +707,8 @@ impl Controller {
             Action::ContainerStop => selected.iter().any(|c| c.is_running()),
             Action::ContainerRestart => !selected.is_empty(),
             Action::ShowLogs => selected.len() == 1,
-            Action::ColimaResources => {
-                self.colima.is_some() && matches!(phase, Phase::Stopped | Phase::Running | Phase::NoEngine)
-            }
+            // Not while half-started: the sizes Colima reports then are unreliable.
+            Action::ColimaResources => self.colima.is_some() && matches!(phase, Phase::Stopped | Phase::Running),
             Action::ContainerPause => selected.iter().any(|c| c.state == "running"),
             Action::ContainerResume => selected.iter().any(|c| c.state == "paused"),
             Action::ShowDetails => st.page == Page::Containers && selected.len() == 1,
@@ -812,9 +809,8 @@ impl Controller {
             Action::OpenTerminal => self.open_terminal(),
             Action::SelectProject => self.select_project(),
             Action::RunningOnly => {
-                let mut st = self.st.borrow_mut();
-                st.running_only = !st.running_only;
-                drop(st);
+                let on = !self.st.borrow().running_only;
+                self.set_running_only(on);
                 self.render();
             }
             // These open through the submenus that menu_will_open fills in.
@@ -827,10 +823,7 @@ impl Controller {
     fn confirm_colima(&self, op: ColimaOp) {
         let running = self.st.borrow().containers.iter().filter(|c| c.is_running()).count();
         let (verb, button) = if op == ColimaOp::Stop { ("Stop", "Stop") } else { ("Restart", "Restart") };
-        let detail = match running {
-            0 => "No containers are running.".to_string(),
-            n => format!("{n} running {} will stop.", pages::plural(n, "container")),
-        };
+        let detail = running_note(running);
         self.confirm(&format!("{verb} Colima?"), &detail, button, move |ctl| ctl.colima_op(op));
     }
 
@@ -848,14 +841,16 @@ impl Controller {
         let on_line = |line| post(Msg::CliLine(line));
         thread::spawn(move || {
             let result = match op {
-                ColimaOp::Start => colima.start(None, on_line),
+                ColimaOp::Start => colima.start(ResourceChange::default(), on_line),
                 ColimaOp::Stop => colima.stop(on_line),
                 // `colima restart` takes no --activate flag, and a plain start
                 // may switch the docker context, so this is spelled out.
-                ColimaOp::Restart => colima.stop(on_line).and_then(|()| colima.start(None, on_line)),
-                ColimaOp::Resize { resources, restart } => {
+                ColimaOp::Restart => {
+                    colima.stop(on_line).and_then(|()| colima.start(ResourceChange::default(), on_line))
+                }
+                ColimaOp::Resize { change, restart } => {
                     let stopped = if restart { colima.stop(on_line) } else { Ok(()) };
-                    stopped.and_then(|()| colima.start(Some(resources), on_line))
+                    stopped.and_then(|()| colima.start(change, on_line))
                 }
             };
             post(Msg::CliDone(result));
@@ -865,7 +860,7 @@ impl Controller {
     /// Asks for a new VM size. Colima only applies it on start, so an up VM is
     /// restarted, with the same warning as a plain restart.
     fn ask_resources(&self) {
-        let up = matches!(self.phase(), Phase::Running | Phase::NoEngine);
+        let up = self.phase() == Phase::Running;
         let (current, running) = {
             let st = self.st.borrow();
             let current = st.info.as_ref().and_then(Resources::current);
@@ -874,7 +869,7 @@ impl Controller {
         let chosen = current.unwrap_or(Resources::DEFAULT);
         let host = NSProcessInfo::processInfo();
         let cpu_values: Vec<u32> = (1..=(host.processorCount() as u32).max(chosen.cpus)).collect();
-        let memory_values: Vec<u32> = (1..=((host.physicalMemory() >> 30) as u32).max(chosen.memory)).collect();
+        let memory_values = Resources::memory_choices((host.physicalMemory() >> 30) as u32, chosen.memory);
         let disk_values = Resources::disk_choices(current.map(|r| r.disk));
 
         let cpus = choice_popup(self.mtm, &cpu_values, "", chosen.cpus);
@@ -892,11 +887,7 @@ impl Controller {
         grid.setFrameSize(grid.fittingSize());
 
         let detail = if up {
-            let stopping = match running {
-                0 => "No containers are running.".to_string(),
-                n => format!("{n} running {} will stop.", pages::plural(n, "container")),
-            };
-            format!("Colima restarts to apply this. {stopping} Disk size can only grow.")
+            format!("Colima restarts to apply this. {} Disk size can only grow.", running_note(running))
         } else {
             "Colima starts with these settings. Disk size can only grow.".to_string()
         };
@@ -910,13 +901,23 @@ impl Controller {
             let pick = |popup: &NSPopUpButton, values: &[u32]| values.get(popup.indexOfSelectedItem() as usize).copied();
             let picked = (pick(&cpus, &cpu_values), pick(&memory, &memory_values), pick(&disk, &disk_values));
             let (Some(c), Some(m), Some(d)) = picked else { return };
-            let resources = Resources { cpus: c, memory: m, disk: d };
-            if response != NSAlertFirstButtonReturn || (up && current == Some(resources)) {
-                return;
+            if response == NSAlertFirstButtonReturn {
+                with_ctl(|ctl| ctl.apply_resources(Resources { cpus: c, memory: m, disk: d }));
             }
-            with_ctl(|ctl| ctl.colima_op(ColimaOp::Resize { resources, restart: up }));
         });
         alert.beginSheetModalForWindow_completionHandler(&self.window, Some(&block));
+    }
+
+    /// Judged now, not when the sheet opened: Colima may have been started or
+    /// stopped from a terminal in between, and a start on a running VM would
+    /// quietly ignore the new size.
+    fn apply_resources(&self, wanted: Resources) {
+        let up = matches!(self.phase(), Phase::Running | Phase::NoEngine);
+        let current = self.st.borrow().info.as_ref().and_then(Resources::current);
+        let change = ResourceChange::between(current, wanted);
+        if !(up && change.is_empty()) {
+            self.colima_op(ColimaOp::Resize { change, restart: up });
+        }
     }
 
     // Containers, images and volumes
@@ -1050,7 +1051,8 @@ impl Controller {
     }
 
     /// Selects every container in the Compose projects of the selected ones, so
-    /// the usual actions apply to the whole project.
+    /// the usual actions apply to the whole project. Filters are cleared when
+    /// they hide part of it, or Remove would quietly miss those containers.
     fn select_project(&self) {
         let keys: Vec<String> = {
             let st = self.st.borrow();
@@ -1063,7 +1065,23 @@ impl Controller {
                 .collect();
             st.containers.iter().filter(|c| projects.contains(&c.project())).map(|c| c.id.clone()).collect()
         };
-        self.containers.select_keys(&keys);
+        if self.containers.select_keys(&keys) < keys.len() {
+            self.st.borrow_mut().filter.clear();
+            self.toolbar.set_search_text("");
+            self.set_running_only(false);
+            self.render();
+            self.containers.select_keys(&keys);
+        }
+    }
+
+    fn set_running_only(&self, on: bool) {
+        self.st.borrow_mut().running_only = on;
+        let (icon, tip) = if on {
+            ("line.3.horizontal.decrease.circle.fill", "Showing running containers only")
+        } else {
+            ("line.3.horizontal.decrease.circle", "Show running containers only")
+        };
+        self.toolbar.set_icon(Action::RunningOnly, icon, tip);
     }
 
     // Details, terminal, ports and mounts: each runs only when asked for.
@@ -1117,7 +1135,10 @@ impl Controller {
             return self.show_error("The Docker CLI is not installed", detail);
         };
         let script = exec_script(&cli, self.docker().socket(), &id);
-        let path = env::temp_dir().join(format!("dockerplus-{}.command", short_id(&id)));
+        // Unique per request: each script deletes itself, so a shared name would
+        // pull the file out from under a second window on the same container.
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let path = env::temp_dir().join(format!("dockerplus-{}-{stamp}.command", short_id(&id)));
         let written = fs::write(&path, script).and_then(|()| fs::set_permissions(&path, fs::Permissions::from_mode(0o700)));
         let url = NSURL::fileURLWithPath(&ns(&path.to_string_lossy()));
         if written.is_err() || !NSWorkspace::sharedWorkspace().openURL(&url) {
@@ -1174,13 +1195,12 @@ impl Controller {
         item.setSubmenu(Some(&submenu));
     }
 
-    /// Opens a URL in the browser, or a host path in Finder.
+    /// Opens a URL in the browser, or shows a host path in Finder. Paths are only
+    /// ever revealed: opening one would launch it if the folder is an app bundle.
     pub fn open_location(&self, location: &str) {
         let workspace = NSWorkspace::sharedWorkspace();
         let opened = if location.starts_with("http://") || location.starts_with("https://") {
             NSURL::URLWithString(&ns(location)).is_some_and(|url| workspace.openURL(&url))
-        } else if Path::new(location).is_dir() {
-            workspace.openURL(&NSURL::fileURLWithPath(&ns(location)))
         } else {
             let url = NSURL::fileURLWithPath(&ns(location));
             workspace.activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&[url]));
@@ -1224,7 +1244,19 @@ impl Controller {
         let id = id.to_string();
         thread::spawn(move || {
             let buffer = LogBuffer::new(generation);
-            let result = docker.logs(&id, LOG_TAIL, true, &cancel, |text| buffer.push(text));
+            let mut tail = LOG_TAIL;
+            let result = loop {
+                let result = docker.logs(&id, tail, true, &cancel, |text| {
+                    if buffer.push(text) {
+                        cancel.interrupt();
+                    }
+                });
+                if cancel.is_cancelled() || !buffer.take_behind() {
+                    break result;
+                }
+                buffer.push(LOG_JUMP_NOTE);
+                tail = LOG_JUMP_TAIL;
+            };
             let error = if cancel.is_cancelled() { None } else { result.err() };
             post(Msg::LogEnded(generation, error));
         });
@@ -1309,6 +1341,13 @@ impl Controller {
     }
 }
 
+fn running_note(running: usize) -> String {
+    match running {
+        0 => "No containers are running.".to_string(),
+        n => format!("{n} running {} will stop.", pages::plural(n, "container")),
+    }
+}
+
 fn choice_popup(mtm: MainThreadMarker, values: &[u32], unit: &str, selected: u32) -> Retained<NSPopUpButton> {
     let popup = NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), NSRect::ZERO, false);
     for value in values {
@@ -1366,6 +1405,9 @@ struct LogBuffer {
 struct LogPending {
     data: Vec<u8>,
     scheduled: bool,
+    /// Time the reader has spent waiting since it was last caught up.
+    waited: Duration,
+    behind: bool,
 }
 
 impl LogBuffer {
@@ -1374,17 +1416,29 @@ impl LogBuffer {
     }
 
     /// Waits while the UI is behind, so the reader slows to the speed of the
-    /// text view. Docker just sends more slowly, and no line is lost.
-    fn push(&self, text: &[u8]) {
+    /// text view and Docker sends more slowly. Returns true once it has waited so
+    /// long that the stream should be reopened at the end of the log.
+    fn push(&self, text: &[u8]) -> bool {
         let mut pending = self.inner.lock().unwrap();
+        let mut waited = false;
         while pending.data.len() >= LOG_BUFFER_LIMIT {
             drop(pending);
             thread::sleep(LOG_BACKOFF);
+            waited = true;
             pending = self.inner.lock().unwrap();
+            pending.waited += LOG_BACKOFF;
         }
+        if !waited && pending.data.is_empty() {
+            pending.waited = Duration::ZERO;
+        }
+        if pending.waited >= LOG_MAX_BEHIND {
+            pending.waited = Duration::ZERO;
+            pending.behind = true;
+        }
+        let behind = pending.behind;
         pending.data.extend_from_slice(text);
         if pending.scheduled {
-            return;
+            return behind;
         }
         pending.scheduled = true;
         let inner = self.inner.clone();
@@ -1397,5 +1451,10 @@ impl LogBuffer {
             };
             with_ctl(|ctl| ctl.append_log(generation, &data));
         });
+        behind
+    }
+
+    fn take_behind(&self) -> bool {
+        std::mem::take(&mut self.inner.lock().unwrap().behind)
     }
 }

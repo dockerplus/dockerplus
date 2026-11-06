@@ -40,6 +40,14 @@ impl Cancel {
         }
     }
 
+    /// Ends the current stream without cancelling, so the caller can open a
+    /// new one with this same `Cancel`.
+    pub fn interrupt(&self) {
+        if let Some(stream) = self.0.lock().unwrap().stream.take() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.0.lock().unwrap().cancelled
     }
@@ -299,6 +307,36 @@ mod tests {
             }
         }
         (out, done)
+    }
+
+    #[test]
+    fn interrupting_ends_a_stream_but_leaves_it_reusable() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("dp-http-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut request = [0u8; 256];
+            let _ = peer.read(&mut request);
+            peer.write_all(b"HTTP/1.1 200 OK\r\n\r\nhello").unwrap();
+            let _ = peer.read(&mut request); // holds the stream open
+        });
+
+        let cancel = Cancel::new();
+        let mut got = Vec::new();
+        let status = stream(&sock, "GET", "/", &cancel, |_, chunk| {
+            got.extend_from_slice(chunk);
+            cancel.interrupt();
+        })
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!((status, got.as_slice()), (200, &b"hello"[..]));
+        assert!(!cancel.is_cancelled());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

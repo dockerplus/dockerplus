@@ -88,6 +88,12 @@ pub fn console(mtm: MainThreadMarker) -> (Retained<NSScrollView>, Retained<NSTex
     text.setHorizontallyResizable(true);
     text.setAutomaticSpellingCorrectionEnabled(false);
     text.setDrawsBackground(false);
+    // TextKit 2 lays out the whole document to scroll to its end, which is most
+    // of the cost of following a busy log. Asking for the layout manager puts the
+    // view on TextKit 1, where non-contiguous layout covers only what is visible.
+    if let Some(layout) = unsafe { text.layoutManager() } {
+        layout.setAllowsNonContiguousLayout(true);
+    }
     if let Some(container) = unsafe { text.textContainer() } {
         container.setWidthTracksTextView(false);
         container.setContainerSize(NSSize::new(f64::MAX / 4.0, f64::MAX / 4.0));

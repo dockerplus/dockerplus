@@ -58,6 +58,36 @@ pub struct Resources {
 
 /// Offered disk sizes. Colima can grow a disk but never shrink it.
 const DISK_STEPS: [u32; 12] = [20, 40, 60, 80, 100, 150, 200, 300, 400, 500, 750, 1000];
+/// RAM kept back for macOS. A VM that fills the rest of the machine stalls it.
+const HOST_RESERVE_GIB: u32 = 4;
+
+/// What a start should change. `None` leaves Colima's saved value alone, so a
+/// value that was only displayed, and rounded on the way, is never written back.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResourceChange {
+    pub cpus: Option<u32>,
+    pub memory: Option<u32>,
+    pub disk: Option<u32>,
+}
+
+impl ResourceChange {
+    /// The difference from `current`. With no VM yet everything is new. The
+    /// disk only ever grows, whatever was asked for.
+    pub fn between(current: Option<Resources>, wanted: Resources) -> Self {
+        let Some(current) = current else {
+            return Self { cpus: Some(wanted.cpus), memory: Some(wanted.memory), disk: Some(wanted.disk) };
+        };
+        Self {
+            cpus: (wanted.cpus != current.cpus).then_some(wanted.cpus),
+            memory: (wanted.memory != current.memory).then_some(wanted.memory),
+            disk: (wanted.disk > current.disk).then_some(wanted.disk),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
 
 impl Resources {
     /// Colima's own defaults, used before a VM exists.
@@ -71,6 +101,11 @@ impl Resources {
         };
         let gib = |bytes: i64| (bytes as f64 / (1u64 << 30) as f64).round() as u32;
         (cpus > 0).then(|| Self { cpus: cpus as u32, memory: gib(memory), disk: gib(disk) })
+    }
+
+    /// Memory sizes to offer, keeping the current one even if it is over the limit.
+    pub fn memory_choices(host_gib: u32, current: u32) -> Vec<u32> {
+        (1..=host_gib.saturating_sub(HOST_RESERVE_GIB).max(current).max(1)).collect()
     }
 
     pub fn disk_choices(current: Option<u32>) -> Vec<u32> {
@@ -128,13 +163,13 @@ impl Colima {
         }
     }
 
-    /// Starts the VM, resizing it first when `resources` is given. Colima saves
-    /// the new size in its config, so later plain starts keep it.
-    pub fn start(&self, resources: Option<Resources>, mut on_line: impl FnMut(String)) -> Result<(), String> {
+    /// Starts the VM with `change` applied. Colima saves the new size in its
+    /// config, so later plain starts keep it.
+    pub fn start(&self, change: ResourceChange, mut on_line: impl FnMut(String)) -> Result<(), String> {
         if let Some(note) = prepare_guest_user()? {
             on_line(note);
         }
-        let args = start_args(&self.profile, resources);
+        let args = start_args(&self.profile, change);
         self.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), on_line)
     }
 
@@ -173,10 +208,10 @@ impl Colima {
     }
 }
 
-fn start_args(profile: &str, resources: Option<Resources>) -> Vec<String> {
+fn start_args(profile: &str, change: ResourceChange) -> Vec<String> {
     let mut args: Vec<String> = ["start", "--activate=false", "--profile", profile].map(String::from).into();
-    if let Some(r) = resources {
-        for (flag, value) in [("--cpus", r.cpus), ("--memory", r.memory), ("--disk", r.disk)] {
+    for (flag, value) in [("--cpus", change.cpus), ("--memory", change.memory), ("--disk", change.disk)] {
+        if let Some(value) = value {
             args.push(flag.to_string());
             args.push(value.to_string());
         }
@@ -311,12 +346,43 @@ mod tests {
 
     #[test]
     fn every_start_refuses_to_change_the_docker_context() {
-        assert!(start_args("default", None).contains(&"--activate=false".to_string()));
-        let sized = Resources { cpus: 4, memory: 8, disk: 120 };
+        let plain = ["start", "--activate=false", "--profile", "default"];
+        assert_eq!(start_args("default", ResourceChange::default()), plain);
+        let everything = ResourceChange { cpus: Some(4), memory: Some(8), disk: Some(120) };
         assert_eq!(
-            start_args("default", Some(sized)),
+            start_args("default", everything),
             ["start", "--activate=false", "--profile", "default", "--cpus", "4", "--memory", "8", "--disk", "120"]
         );
+    }
+
+    #[test]
+    fn only_what_changed_reaches_colima() {
+        let current = Resources { cpus: 2, memory: 3, disk: 100 };
+        let change = ResourceChange::between(Some(current), Resources { cpus: 4, ..current });
+        assert_eq!(start_args("default", change)[4..], ["--cpus", "4"]);
+        assert!(ResourceChange::between(Some(current), current).is_empty());
+    }
+
+    #[test]
+    fn a_disk_is_never_asked_to_shrink() {
+        let current = Resources { cpus: 2, memory: 2, disk: 100 };
+        assert_eq!(ResourceChange::between(Some(current), Resources { disk: 40, ..current }).disk, None);
+        assert_eq!(ResourceChange::between(Some(current), Resources { disk: 150, ..current }).disk, Some(150));
+    }
+
+    #[test]
+    fn a_first_start_sends_every_value() {
+        let wanted = Resources { cpus: 4, memory: 8, disk: 60 };
+        let expected = ResourceChange { cpus: Some(4), memory: Some(8), disk: Some(60) };
+        assert_eq!(ResourceChange::between(None, wanted), expected);
+    }
+
+    #[test]
+    fn memory_choices_leave_room_for_macos() {
+        assert_eq!(Resources::memory_choices(32, 2).last(), Some(&28));
+        assert_eq!(Resources::memory_choices(32, 30).last(), Some(&30));
+        assert_eq!(Resources::memory_choices(4, 2).last(), Some(&2));
+        assert_eq!(Resources::memory_choices(2, 0), [1]);
     }
 
     #[test]

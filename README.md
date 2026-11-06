@@ -11,11 +11,13 @@ Requires macOS 26 or later.
 ## Features
 
 - **Colima:** VM status and settings; start, stop and restart with live output;
-  change CPUs, memory and disk.
+  change CPUs, memory and disk. Memory stops 4 GiB short of the Mac's total, and disks
+  only grow.
 - **Containers:** list, start, stop, restart, pause, resume, remove; follow logs;
   details with image digest, command, ports, mounts and networks.
 - From a container's context menu: open a shell in Terminal, open a published port
-  in the browser, show a bind mount in Finder, or select its whole Compose project.
+  in the browser, show a bind mount in Finder, or select its whole Compose project
+  (this clears any filter hiding part of it).
 - **Images:** list by tag, pull, remove.
 - **Volumes:** list with size and the containers using them; remove.
 - Filter, sort and multi-select in every table. Show only running containers.
@@ -74,8 +76,10 @@ Brand guide: [assets/brand/rex/BRAND.md](assets/brand/rex/BRAND.md).
 ## UI testing
 
 A build with `--features devtools` opens a control socket that drives the real UI
-(`state`, `page containers`, `do ContainerStop`, `snapshot <path>`, …). Default builds
-do not include it.
+(`state`, `page containers`, `do ContainerStop`, `key cmd+2`, `clickrow <name>`,
+`snapshot <path>`, …). Default builds do not include it. The window must be active for
+synthetic clicks, because macOS ignores the first click on an inactive window: send
+`front` first.
 
 ```bash
 scripts/bundle.sh --features devtools
@@ -87,9 +91,11 @@ open --env DOCKERPLUS_DEV_SOCK="$PWD/target/dp.sock" target/DockerPlus.app
 Version 0.1, tested on an M1 Pro MacBook Pro with macOS 27.2, Colima 0.10.3 and Docker
 Engine 29.5.2.
 
-- Not tested yet: physical mouse and keyboard input (tests go through the dev socket),
+- Shortcuts, clicks, double-clicks and sorting are tested with synthetic events sent
+  through `NSApp sendEvent:`, which covers menus, hit testing and click counting.
+- Not tested yet: a physical mouse and keyboard, the open context menu itself,
   macOS 26.x, Reduce Transparency and Increase Contrast.
 - Not supported yet: Colima profiles other than `default`, Compose up and down,
   networks, per-container stats, signing and notarization.
-- Known issue: a container that floods its logs pushes CPU to about 90% while the log
-  panel is open.
+- The log panel shows at most about 5 MB/s. A container that logs faster than that
+  stays live: the panel skips ahead to the latest lines and says so.
