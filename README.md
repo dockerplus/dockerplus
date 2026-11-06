@@ -40,6 +40,7 @@ Needs macOS 26 or later on Apple silicon, and [Homebrew](https://brew.sh).
 
 ```bash
 brew tap dockerplus/dockerplus https://github.com/dockerplus/dockerplus
+brew trust dockerplus/dockerplus
 brew install --cask dockerplus
 ```
 
