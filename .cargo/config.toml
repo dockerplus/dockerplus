@@ -1,0 +1,4 @@
+# Liquid Glass needs a binary linked against the macOS 26+ SDK. This target also
+# lets us use NSGlassEffectView and friends without availability checks.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "26.0"
