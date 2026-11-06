@@ -143,6 +143,27 @@ impl Controller {
                 }
             }
             "responder" => self.window.firstResponder().map_or("none".into(), |r| r.class().name().to_string_lossy().to_string()),
+            // `bench <n>`: microseconds per table render and per full render.
+            "bench" => {
+                let runs: u32 = argument.parse().unwrap_or(100);
+                let start = std::time::Instant::now();
+                for _ in 0..runs {
+                    self.render_tables();
+                }
+                let tables = start.elapsed().as_micros() / runs as u128;
+                let start = std::time::Instant::now();
+                for _ in 0..runs {
+                    self.render();
+                }
+                json!({"tables_us": tables, "render_us": start.elapsed().as_micros() / runs as u128}).to_string()
+            }
+            "fetches" => {
+                let counts: Vec<usize> = crate::backend::docker::FETCHES.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+                json!({"containers": counts[0], "images": counts[1], "volumes": counts[2]}).to_string()
+            }
+            // Replacement characters in the log view: text damaged by decoding.
+            "logbad" => self.logs.text.string().to_string().matches('\u{fffd}').count().to_string(),
+            "loglen" => self.logs.text.string().length().to_string(),
             "modal" => self.dev_modal(argument),
             "close" => {
                 self.window.performClose(None);

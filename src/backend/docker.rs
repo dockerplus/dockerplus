@@ -30,11 +30,58 @@ pub enum ContainerAction {
     Unpause,
 }
 
+/// Requests made for the containers, images and volumes lists, for measuring.
+#[cfg(feature = "devtools")]
+pub static FETCHES: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+
+/// Which lists a refresh should fetch.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Scope {
+    pub containers: bool,
+    pub images: bool,
+    pub volumes: bool,
+}
+
+impl Scope {
+    pub const ALL: Self = Self { containers: true, images: true, volumes: true };
+    pub const CONTAINERS: Self = Self { containers: true, images: false, volumes: false };
+    pub const IMAGES: Self = Self { containers: false, images: true, volumes: false };
+    pub const VOLUMES: Self = Self { containers: false, images: false, volumes: true };
+
+    pub fn merge(&mut self, other: Self) {
+        self.containers |= other.containers;
+        self.images |= other.images;
+        self.volumes |= other.volumes;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The list an engine event touches. Image and volume "used by" columns come
+    /// from the containers list, so container events need nothing else. Anything
+    /// unreadable refreshes everything, since a stale list is worse than a fetch.
+    fn of_event(line: &str) -> Self {
+        #[derive(serde::Deserialize)]
+        struct Event {
+            #[serde(rename = "Type")]
+            kind: String,
+        }
+        match serde_json::from_str::<Event>(line).map(|event| event.kind).as_deref() {
+            Ok("container") => Self::CONTAINERS,
+            Ok("image") => Self::IMAGES,
+            Ok("volume") => Self::VOLUMES,
+            _ => Self::ALL,
+        }
+    }
+}
+
+/// The lists a refresh fetched; the rest are left as they were.
 #[derive(Default)]
 pub struct Snapshot {
-    pub containers: Vec<Container>,
-    pub images: Vec<Image>,
-    pub volumes: Vec<Volume>,
+    pub containers: Option<Vec<Container>>,
+    pub images: Option<Vec<Image>>,
+    pub volumes: Option<Vec<Volume>>,
 }
 
 impl Docker {
@@ -68,12 +115,22 @@ impl Docker {
         self.get_json("/version")
     }
 
-    pub fn snapshot(&self) -> DResult<Snapshot> {
-        Ok(Snapshot {
-            containers: self.get_json("/containers/json?all=1")?,
-            images: self.get_json("/images/json")?,
-            volumes: self.get_json::<VolumeList>("/volumes")?.volumes,
-        })
+    pub fn snapshot(&self, scope: Scope) -> DResult<Snapshot> {
+        #[cfg(feature = "devtools")]
+        for (count, fetched) in FETCHES.iter().zip([scope.containers, scope.images, scope.volumes]) {
+            count.fetch_add(fetched as usize, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut snapshot = Snapshot::default();
+        if scope.containers {
+            snapshot.containers = Some(self.get_json("/containers/json?all=1")?);
+        }
+        if scope.images {
+            snapshot.images = Some(self.get_json("/images/json")?);
+        }
+        if scope.volumes {
+            snapshot.volumes = Some(self.get_json::<VolumeList>("/volumes")?.volumes);
+        }
+        Ok(snapshot)
     }
 
     /// Volume sizes need the engine to walk the disk, so they are fetched apart
@@ -193,9 +250,9 @@ impl Docker {
         error.map_or(Ok(()), Err)
     }
 
-    /// Blocks until the event stream ends, calling `on_event` for each change
-    /// that could alter what the app shows.
-    pub fn watch_events(&self, cancel: &Cancel, mut on_event: impl FnMut()) -> DResult<()> {
+    /// Blocks until the event stream ends, reporting which list each change
+    /// could alter.
+    pub fn watch_events(&self, cancel: &Cancel, mut on_event: impl FnMut(Scope)) -> DResult<()> {
         // Health checks fire exec_* events constantly; they change nothing here.
         let filters = serde_json::json!({
             "type": ["container", "image", "volume"],
@@ -203,9 +260,12 @@ impl Docker {
                       "rename", "pull", "delete", "tag", "untag", "load", "health_status"],
         });
         let path = format!("/events?filters={}", encode(&filters.to_string()));
-        http::stream(&self.sock, "GET", &path, cancel, |_, _| on_event())
-            .map(drop)
-            .map_err(|e| e.to_string())
+        let mut lines = LineSplitter::default();
+        http::stream(&self.sock, "GET", &path, cancel, |_, chunk| {
+            lines.feed(chunk, |line| on_event(Scope::of_event(line)));
+        })
+        .map(drop)
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -368,6 +428,28 @@ mod tests {
             }
             assert_eq!(out, b"out line\nerr line\n", "piece size {piece}");
         }
+    }
+
+    #[test]
+    fn events_refresh_only_their_own_list() {
+        assert_eq!(Scope::of_event(r#"{"Type":"container","Action":"start"}"#), Scope::CONTAINERS);
+        assert_eq!(Scope::of_event(r#"{"Type":"image","Action":"pull"}"#), Scope::IMAGES);
+        assert_eq!(Scope::of_event(r#"{"Type":"volume","Action":"create"}"#), Scope::VOLUMES);
+    }
+
+    #[test]
+    fn anything_unreadable_refreshes_everything() {
+        assert_eq!(Scope::of_event(r#"{"Type":"network"}"#), Scope::ALL);
+        assert_eq!(Scope::of_event("not json"), Scope::ALL);
+    }
+
+    #[test]
+    fn scopes_add_up() {
+        let mut scope = Scope::default();
+        assert!(scope.is_empty());
+        scope.merge(Scope::IMAGES);
+        scope.merge(Scope::VOLUMES);
+        assert_eq!(scope, Scope { containers: false, images: true, volumes: true });
     }
 
     #[test]

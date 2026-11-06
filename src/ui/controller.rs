@@ -4,14 +4,14 @@
 use super::actions::{Action, Actions};
 use super::colima_page::ColimaPage;
 use super::hud::{EmptyState, HUD_CLEARANCE, Hud};
-use super::logs::LogPanel;
+use super::logs::{LogCleaner, LogPanel};
 use super::pages::{self, Page};
 use super::sidebar::{Sidebar, StatusView};
 use super::table::{Table, filter_rows};
 use super::toolbar::Toolbar;
 use super::util::*;
 use crate::backend::colima::{Colima, ColimaInfo, ResourceChange, Resources, find_tool};
-use crate::backend::docker::{ContainerAction, DResult, Docker, Snapshot, exec_script};
+use crate::backend::docker::{ContainerAction, DResult, Docker, Scope, Snapshot, exec_script};
 use crate::backend::http::Cancel;
 use crate::backend::model::*;
 use block2::RcBlock;
@@ -45,7 +45,7 @@ const LOG_BACKOFF: Duration = Duration::from_millis(15);
 /// this it gives up on the backlog and reconnects at the end of the log.
 const LOG_MAX_BEHIND: Duration = Duration::from_secs(2);
 const LOG_JUMP_TAIL: u32 = 200;
-const LOG_JUMP_NOTE: &[u8] = b"\n--- too much output to show it all: skipped ahead to the latest lines ---\n\n";
+const LOG_JUMP_NOTE: &str = "\n--- too much output to show it all: skipped ahead to the latest lines ---\n\n";
 /// Coalesces bursts of engine events, such as a `compose up`, into one refresh.
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(120);
 /// Keeps "Up 3 minutes" and relative dates from going stale without any events.
@@ -57,7 +57,7 @@ const COLIMA_RECHECK: Duration = Duration::from_secs(3);
 pub enum Msg {
     Colima(Box<ColimaInfo>),
     Engine(bool),
-    Changed,
+    Changed(Scope),
     Snapshot(DResult<Snapshot>),
     Version(Option<EngineVersion>),
     VolumeSizes(HashMap<String, i64>),
@@ -138,7 +138,8 @@ pub struct State {
     sizes: HashMap<String, i64>,
     filter: String,
     refreshing: bool,
-    refresh_again: bool,
+    /// Lists waiting to be fetched by the next refresh.
+    stale: Scope,
     refresh_scheduled: bool,
     recheck_scheduled: bool,
     busy_actions: usize,
@@ -342,15 +343,15 @@ impl Controller {
                     self.adopt_socket(socket);
                 }
                 self.st.borrow_mut().info = Some(*info);
-                self.render();
+                self.render_chrome();
                 self.recheck_if_unsettled();
             }
             Msg::Engine(up) => self.engine_changed(up),
-            Msg::Changed => self.schedule_refresh(),
+            Msg::Changed(scope) => self.schedule_refresh(scope),
             Msg::Snapshot(result) => self.snapshot_arrived(result),
             Msg::Version(version) => {
                 self.st.borrow_mut().engine = version;
-                self.render();
+                self.render_chrome();
             }
             Msg::VolumeSizes(sizes) => {
                 self.st.borrow_mut().sizes = sizes;
@@ -364,7 +365,7 @@ impl Controller {
                     self.show_error("Colima could not finish", &error);
                 }
                 self.reload_colima();
-                self.render();
+                self.render_chrome();
             }
             Msg::ActionDone(error) => {
                 {
@@ -374,20 +375,20 @@ impl Controller {
                 if let Some(error) = error {
                     self.show_error("Docker refused that", &error);
                 }
-                self.refresh();
-                self.render();
+                self.refresh(Scope::ALL);
+                self.render_chrome();
             }
             Msg::PullProgress(text) => {
                 self.st.borrow_mut().pull = Some(text);
-                self.render();
+                self.render_chrome();
             }
             Msg::PullDone(result) => {
                 self.st.borrow_mut().pull = None;
                 if let Err(error) = result {
                     self.show_error("Could not pull the image", &error);
                 }
-                self.refresh();
-                self.render();
+                self.refresh(Scope::IMAGES);
+                self.render_chrome();
             }
             Msg::LogEnded(generation, error) => self.log_ended(generation, error),
             Msg::Details(result) => self.details_arrived(result),
@@ -408,7 +409,7 @@ impl Controller {
     fn reload_colima(&self) {
         let Some(colima) = self.colima.clone() else {
             self.st.borrow_mut().info = Some(ColimaInfo::default());
-            self.render();
+            self.render_chrome();
             return;
         };
         thread::spawn(move || post(Msg::Colima(Box::new(colima.info()))));
@@ -447,7 +448,7 @@ impl Controller {
             }
         }
         if up {
-            self.refresh();
+            self.refresh(Scope::ALL);
             let docker = self.docker();
             thread::spawn(move || post(Msg::Version(docker.version().ok())));
             // Open on Containers if Colima was already up at launch, but leave
@@ -468,26 +469,25 @@ impl Controller {
         self.render();
     }
 
-    /// One refresh at a time; anything arriving meanwhile queues exactly one more.
-    fn refresh(&self) {
-        {
+    /// One refresh at a time; lists asked for meanwhile wait for the next one.
+    fn refresh(&self, scope: Scope) {
+        let scope = {
             let mut st = self.st.borrow_mut();
-            if !st.engine_up {
-                return;
-            }
-            if st.refreshing {
-                st.refresh_again = true;
+            st.stale.merge(scope);
+            if !st.engine_up || st.refreshing || st.stale.is_empty() {
                 return;
             }
             st.refreshing = true;
-        }
+            std::mem::take(&mut st.stale)
+        };
         let docker = self.docker();
-        thread::spawn(move || post(Msg::Snapshot(docker.snapshot())));
+        thread::spawn(move || post(Msg::Snapshot(docker.snapshot(scope))));
     }
 
-    fn schedule_refresh(&self) {
+    fn schedule_refresh(&self, scope: Scope) {
         {
             let mut st = self.st.borrow_mut();
+            st.stale.merge(scope);
             if st.refresh_scheduled {
                 return;
             }
@@ -496,29 +496,32 @@ impl Controller {
         after_main(REFRESH_DEBOUNCE, || {
             with_ctl(|ctl| {
                 ctl.st.borrow_mut().refresh_scheduled = false;
-                ctl.refresh();
+                ctl.refresh(Scope::default());
             });
         });
     }
 
     fn snapshot_arrived(&self, result: DResult<Snapshot>) {
-        let (again, volumes_changed) = {
+        let volumes_changed = {
             let mut st = self.st.borrow_mut();
             st.refreshing = false;
-            let again = std::mem::take(&mut st.refresh_again);
             let mut volumes_changed = false;
             if let Ok(snapshot) = result {
-                volumes_changed = st.volumes != snapshot.volumes;
-                st.containers = snapshot.containers;
-                st.images = snapshot.images;
-                st.volumes = snapshot.volumes;
+                if let Some(containers) = snapshot.containers {
+                    st.containers = containers;
+                }
+                if let Some(images) = snapshot.images {
+                    st.images = images;
+                }
+                if let Some(volumes) = snapshot.volumes {
+                    volumes_changed = st.volumes != volumes;
+                    st.volumes = volumes;
+                }
             }
-            (again, volumes_changed)
+            volumes_changed
         };
         self.render();
-        if again {
-            self.refresh();
-        }
+        self.refresh(Scope::default());
         if volumes_changed {
             self.load_volume_sizes();
         }
@@ -540,7 +543,7 @@ impl Controller {
         after_main(TICK, || {
             with_ctl(|ctl| {
                 if NSApplication::sharedApplication(ctl.mtm).isActive() {
-                    ctl.refresh();
+                    ctl.refresh(Scope::CONTAINERS);
                 }
                 ctl.tick();
             });
@@ -551,28 +554,40 @@ impl Controller {
 
     pub fn render(&self) {
         self.render_tables();
+        self.render_chrome();
+    }
+
+    /// Everything but the table rows, for changes that leave the data alone.
+    fn render_chrome(&self) {
         self.render_status();
         self.render_page();
         self.render_toolbar();
     }
 
-    fn render_tables(&self) {
-        let (containers, images, volumes) = {
+    /// Only the page on screen gets rows; `show_page` renders the next one.
+    pub(super) fn render_tables(&self) {
+        let (table, rows) = {
             let st = self.st.borrow();
             let now = now();
             let query = st.filter.as_str();
-            (
-                filter_rows(
-                    pages::container_rows(st.containers.iter().filter(|c| !st.running_only || c.is_running()), now),
-                    query,
+            match st.page {
+                Page::Colima => (None, Vec::new()),
+                Page::Containers => {
+                    let shown = st.containers.iter().filter(|c| !st.running_only || c.is_running());
+                    (Some(&self.containers), filter_rows(pages::container_rows(shown, now), query))
+                }
+                Page::Images => {
+                    (Some(&self.images), filter_rows(pages::image_rows(&st.images, &st.containers, now), query))
+                }
+                Page::Volumes => (
+                    Some(&self.volumes),
+                    filter_rows(pages::volume_rows(&st.volumes, &st.containers, &st.sizes, now), query),
                 ),
-                filter_rows(pages::image_rows(&st.images, &st.containers, now), query),
-                filter_rows(pages::volume_rows(&st.volumes, &st.containers, &st.sizes, now), query),
-            )
+            }
         };
-        self.containers.set_rows(containers);
-        self.images.set_rows(images);
-        self.volumes.set_rows(volumes);
+        if let Some(table) = table {
+            table.set_rows(rows);
+        }
 
         let st = self.st.borrow();
         let up = st.engine_up;
@@ -785,7 +800,7 @@ impl Controller {
             }
             Action::Pull => self.ask_pull(),
             Action::Refresh => {
-                self.refresh();
+                self.refresh(Scope::ALL);
                 self.reload_colima();
                 self.load_volume_sizes();
             }
@@ -837,7 +852,7 @@ impl Controller {
             st.op = Some(op);
         }
         clear_text(&self.colima_page.console);
-        self.render();
+        self.render_chrome();
         let on_line = |line| post(Msg::CliLine(line));
         thread::spawn(move || {
             let result = match op {
@@ -948,7 +963,7 @@ impl Controller {
     /// Runs engine work off the main thread, tracked by the activity capsule.
     fn run_docker(&self, work: impl FnOnce(&Docker) -> Option<String> + Send + 'static) {
         self.st.borrow_mut().busy_actions += 1;
-        self.render();
+        self.render_chrome();
         let docker = self.docker();
         thread::spawn(move || post(Msg::ActionDone(work(&docker))));
     }
@@ -1035,7 +1050,7 @@ impl Controller {
 
     fn pull(&self, reference: String) {
         self.st.borrow_mut().pull = Some(format!("starting {reference}"));
-        self.render();
+        self.render_chrome();
         let docker = self.docker();
         thread::spawn(move || {
             let result = docker.pull(&reference, |text| post(Msg::PullProgress(text)));
@@ -1246,11 +1261,13 @@ impl Controller {
             let buffer = LogBuffer::new(generation);
             let mut tail = LOG_TAIL;
             let result = loop {
-                let result = docker.logs(&id, tail, true, &cancel, |text| {
-                    if buffer.push(text) {
+                let mut cleaner = LogCleaner::default();
+                let result = docker.logs(&id, tail, true, &cancel, |raw| {
+                    if buffer.push(&cleaner.feed(raw)) {
                         cancel.interrupt();
                     }
                 });
+                buffer.push(&cleaner.finish());
                 if cancel.is_cancelled() || !buffer.take_behind() {
                     break result;
                 }
@@ -1275,7 +1292,7 @@ impl Controller {
         self.detail.adjustSubviews();
     }
 
-    fn append_log(&self, generation: u64, data: &[u8]) {
+    fn append_log(&self, generation: u64, data: &str) {
         let current = self.st.borrow().logs.as_ref().is_some_and(|s| s.generation == generation);
         if current {
             self.logs.append(data);
@@ -1381,8 +1398,10 @@ fn spawn_watcher(docker: Arc<Mutex<Docker>>) {
                     up = true;
                     post(Msg::Engine(true));
                 }
-                let _ = current.watch_events(&Cancel::new(), || post(Msg::Changed));
+                let _ = current.watch_events(&Cancel::new(), |scope| post(Msg::Changed(scope)));
                 thread::sleep(Duration::from_millis(300));
+                // Anything could have happened while the stream was down.
+                post(Msg::Changed(Scope::ALL));
             } else {
                 if up {
                     up = false;
@@ -1403,7 +1422,7 @@ struct LogBuffer {
 
 #[derive(Default)]
 struct LogPending {
-    data: Vec<u8>,
+    data: String,
     scheduled: bool,
     /// Time the reader has spent waiting since it was last caught up.
     waited: Duration,
@@ -1418,7 +1437,10 @@ impl LogBuffer {
     /// Waits while the UI is behind, so the reader slows to the speed of the
     /// text view and Docker sends more slowly. Returns true once it has waited so
     /// long that the stream should be reopened at the end of the log.
-    fn push(&self, text: &[u8]) -> bool {
+    fn push(&self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
         let mut pending = self.inner.lock().unwrap();
         let mut waited = false;
         while pending.data.len() >= LOG_BUFFER_LIMIT {
@@ -1436,7 +1458,7 @@ impl LogBuffer {
             pending.behind = true;
         }
         let behind = pending.behind;
-        pending.data.extend_from_slice(text);
+        pending.data.push_str(text);
         if pending.scheduled {
             return behind;
         }

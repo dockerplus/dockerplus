@@ -72,12 +72,11 @@ impl LogPanel {
         }
     }
 
-    pub fn append(&self, raw: &[u8]) {
-        let cleaned = strip_ansi(raw);
-        if cleaned.is_empty() {
+    pub fn append(&self, text: &str) {
+        if text.is_empty() {
             return;
         }
-        append_text(&self.text, &cleaned);
+        append_text(&self.text, text);
         self.trim();
         if self.following.get() {
             scroll_to_end(&self.text);
@@ -115,9 +114,68 @@ fn tool_button(
     button
 }
 
+/// Turns a log stream into clean text on the reading thread, off the main one.
+/// Socket reads can end anywhere, so whatever is cut off at the end of a chunk, a
+/// multi-byte character or a colour code, waits for the rest to arrive.
+#[derive(Default)]
+pub struct LogCleaner {
+    held: Vec<u8>,
+}
+
+impl LogCleaner {
+    pub fn feed(&mut self, raw: &[u8]) -> String {
+        self.held.extend_from_slice(raw);
+        let ready = self.held.len() - unfinished_tail(&self.held);
+        let text = strip_ansi(&self.held[..ready]);
+        self.held.drain(..ready);
+        text
+    }
+
+    /// Whatever is left when the stream ends.
+    pub fn finish(&mut self) -> String {
+        let text = strip_ansi(&self.held);
+        self.held.clear();
+        text
+    }
+}
+
+/// How many bytes at the end belong to something not yet complete.
+fn unfinished_tail(data: &[u8]) -> usize {
+    const LONGEST_ESCAPE: usize = 32;
+    let from = data.len().saturating_sub(LONGEST_ESCAPE);
+    if let Some(start) = data[from..].iter().rposition(|byte| *byte == 0x1b).map(|i| from + i) {
+        let escape = &data[start..];
+        let finished = match escape.get(1) {
+            None => false,
+            Some(b'[') => escape[2..].iter().any(|byte| (0x40..=0x7e).contains(byte)),
+            Some(_) => true,
+        };
+        if !finished {
+            return escape.len();
+        }
+    }
+    for back in 1..=data.len().min(3) {
+        let byte = data[data.len() - back];
+        if byte & 0xc0 == 0x80 {
+            continue; // a continuation byte: keep looking for its start
+        }
+        let needed = match byte {
+            0xf0.. => 4,
+            0xe0.. => 3,
+            0xc0.. => 2,
+            _ => 1,
+        };
+        return if back < needed { back } else { 0 };
+    }
+    0
+}
+
 /// Decodes log bytes and removes ANSI colour and cursor sequences.
 pub fn strip_ansi(raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);
+    if !text.contains(['\u{1b}', '\r']) {
+        return text.into_owned();
+    }
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -143,11 +201,37 @@ pub fn strip_ansi(raw: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_ansi;
+    use super::{LogCleaner, strip_ansi};
 
     #[test]
     fn colour_codes_and_carriage_returns_go() {
         assert_eq!(strip_ansi(b"\x1b[31;1mred\x1b[0m text\r\n"), "red text\n");
+    }
+
+    #[test]
+    fn splitting_a_stream_anywhere_changes_nothing() {
+        let wire = "dòng \u{1b}[32mtiếng Việt\u{1b}[0m ắ ộ ữ 🦖\r\nnext\n".as_bytes();
+        let whole = strip_ansi(wire);
+        assert!(!whole.contains('\u{fffd}') && !whole.contains('\u{1b}'));
+        for at in 0..=wire.len() {
+            let mut cleaner = LogCleaner::default();
+            let mut out = cleaner.feed(&wire[..at]);
+            out.push_str(&cleaner.feed(&wire[at..]));
+            out.push_str(&cleaner.finish());
+            assert_eq!(out, whole, "split at byte {at}");
+        }
+        let mut cleaner = LogCleaner::default();
+        let mut one_by_one: String = wire.iter().map(|byte| cleaner.feed(&[*byte])).collect();
+        one_by_one.push_str(&cleaner.finish());
+        assert_eq!(one_by_one, whole);
+    }
+
+    #[test]
+    fn a_stream_cut_mid_character_still_ends_cleanly() {
+        let mut cleaner = LogCleaner::default();
+        assert_eq!(cleaner.feed(&"ắ".as_bytes()[..2]), "");
+        assert_eq!(cleaner.finish(), "\u{fffd}");
+        assert_eq!(cleaner.finish(), "");
     }
 
     #[test]
