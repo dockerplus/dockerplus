@@ -7,9 +7,10 @@ use super::util::*;
 use crate::backend::colima::ColimaInfo;
 use crate::backend::model::{EngineVersion, human_gib};
 use objc2::rc::Retained;
-use objc2::sel;
+use objc2::{MainThreadOnly, sel};
 use objc2_app_kit::*;
 use objc2_foundation::*;
+use std::cell::RefCell;
 
 const KEY_COLUMN_WIDTH: f64 = 110.0;
 const FIELDS: [&str; 10] = [
@@ -20,6 +21,10 @@ const FIELDS: [&str; 10] = [
 pub struct ColimaPage {
     pub view: Retained<NSView>,
     headline: Retained<NSTextField>,
+    pub profile: Retained<NSPopUpButton>,
+    /// The names `profile` lists now, so it is only rebuilt when they change:
+    /// rebuilding would disturb a menu someone has open.
+    profiles: RefCell<Vec<String>>,
     values: Vec<Retained<NSTextField>>,
     pub start: Retained<NSButton>,
     pub stop: Retained<NSButton>,
@@ -33,11 +38,19 @@ impl ColimaPage {
         let view = NSView::new(mtm);
 
         let headline = secondary_label(mtm, "", 13.0);
+        let profile = NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), NSRect::ZERO, false);
+        unsafe {
+            profile.setTarget(Some(actions));
+            profile.setAction(Some(sel!(dpPerform:)));
+        }
+        profile.setTag(Action::ColimaProfile as NSInteger);
+        profile.setToolTip(Some(&ns("Colima profile")));
+        let header = hstack(mtm, 10.0, &[&profile, &headline]);
 
         let start = action_button(mtm, actions, "Start", "play.fill", Action::ColimaStart);
         let stop = action_button(mtm, actions, "Stop", "stop.fill", Action::ColimaStop);
         let restart = action_button(mtm, actions, "Restart", "arrow.clockwise", Action::ColimaRestart);
-        let resources = action_button(mtm, actions, "Resources…", "slider.horizontal.3", Action::ColimaResources);
+        let resources = action_button(mtm, actions, "VM Settings…", "slider.horizontal.3", Action::ColimaResources);
         glass::button(&start, true);
         glass::button(&stop, false);
         glass::button(&restart, false);
@@ -76,8 +89,8 @@ impl ColimaPage {
         frame.setContentHuggingPriority_forOrientation(1.0, NSLayoutConstraintOrientation::Vertical);
         frame.setContentCompressionResistancePriority_forOrientation(200.0, NSLayoutConstraintOrientation::Vertical);
 
-        let stack = vstack(mtm, 6.0, &[&headline, &buttons, &grid, &output, &frame]);
-        stack.setCustomSpacing_afterView(14.0, &headline);
+        let stack = vstack(mtm, 6.0, &[&header, &buttons, &grid, &output, &frame]);
+        stack.setCustomSpacing_afterView(14.0, &header);
         stack.setCustomSpacing_afterView(20.0, &buttons);
         stack.setCustomSpacing_afterView(20.0, &grid);
         view.addSubview(&stack);
@@ -92,7 +105,44 @@ impl ColimaPage {
             frame.heightAnchor().constraintGreaterThanOrEqualToConstant(90.0),
         ]);
 
-        Self { view, headline, values, start, stop, restart, resources, console: console_text }
+        Self {
+            view,
+            headline,
+            profile,
+            profiles: RefCell::default(),
+            values,
+            start,
+            stop,
+            restart,
+            resources,
+            console: console_text,
+        }
+    }
+
+    /// Lists `names` and a last "New Profile…" entry, with `current` chosen.
+    pub fn set_profiles(&self, names: &[String], current: &str, enabled: bool) {
+        if *self.profiles.borrow() != names {
+            self.profile.removeAllItems();
+            for name in names {
+                self.profile.addItemWithTitle(&ns(name));
+            }
+            if let Some(menu) = self.profile.menu() {
+                menu.addItem(&NSMenuItem::separatorItem(self.profile.mtm()));
+            }
+            self.profile.addItemWithTitle(&ns("New Profile…"));
+            if let Some(item) = self.profile.lastItem() {
+                item.setTag(Action::ColimaNewProfile as NSInteger);
+            }
+            *self.profiles.borrow_mut() = names.to_vec();
+        }
+        self.profile.selectItemWithTitle(&ns(current));
+        self.profile.setEnabled(enabled);
+    }
+
+    /// The profile just picked, or `None` for "New Profile…".
+    pub fn picked_profile(&self) -> Option<String> {
+        let item = self.profile.selectedItem()?;
+        (item.tag() != Action::ColimaNewProfile as NSInteger).then(|| item.title().to_string())
     }
 
     pub fn update(
@@ -112,8 +162,10 @@ impl ColimaPage {
         let memory = number(live.map(|s| s.memory), profile.map(|p| p.memory)).map(human_gib);
         let disk = number(live.map(|s| s.disk), profile.map(|p| p.disk)).map(human_gib);
         let runtime = live.map(|s| s.runtime.clone()).or(profile.map(|p| p.runtime.clone()));
-        let vm = live.map(|s| format!("{} ({})", s.driver, s.arch));
-        let mount = live.map(|s| s.mount_type.clone());
+        // A stopped VM still has the type and mount its config fixes.
+        let settings = info.settings.as_ref();
+        let vm = live.map(|s| format!("{} ({})", s.driver, s.arch)).or(settings.map(|s| s.vm_type.clone()));
+        let mount = live.map(|s| s.mount_type.clone()).or(settings.map(|s| s.mount_type.clone()));
         let docker = engine.map(|e| format!("{} (API {}, kernel {})", e.version, e.api_version, e.kernel_version));
         let socket = live.map(|s| s.docker_socket.trim_start_matches("unix://").to_string());
 

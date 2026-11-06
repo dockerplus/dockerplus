@@ -72,7 +72,7 @@ pub fn request(
     timeout: Duration,
 ) -> io::Result<Response> {
     let mut collected = Vec::new();
-    let status = exchange(sock, method, path, body, Some(timeout), None, |_, chunk| {
+    let status = exchange(sock, method, path, body, Some(timeout), None, None, |_, chunk| {
         collected.extend_from_slice(chunk);
     })?;
     Ok(Response { status, body: collected })
@@ -88,9 +88,32 @@ pub fn stream(
     cancel: &Cancel,
     on_chunk: impl FnMut(u16, &[u8]),
 ) -> io::Result<u16> {
-    exchange(sock, method, path, None, None, Some(cancel), on_chunk)
+    exchange(sock, method, path, None, None, Some(cancel), None, on_chunk)
 }
 
+/// Like [`stream`], for a response that can stay silent for a long time. After
+/// `idle` without a byte it asks `alive` whether the other end is still there,
+/// and gives up when it is not: silence alone cannot tell a quiet server from a
+/// connection that died while the Mac slept.
+pub fn stream_watched(
+    sock: &Path,
+    method: &str,
+    path: &str,
+    cancel: &Cancel,
+    idle: Duration,
+    mut alive: impl FnMut() -> bool,
+    on_chunk: impl FnMut(u16, &[u8]),
+) -> io::Result<u16> {
+    let watch = Watch { idle, alive: &mut alive };
+    exchange(sock, method, path, None, None, Some(cancel), Some(watch), on_chunk)
+}
+
+struct Watch<'a> {
+    idle: Duration,
+    alive: &'a mut dyn FnMut() -> bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn exchange(
     sock: &Path,
     method: &str,
@@ -98,10 +121,11 @@ fn exchange(
     body: Option<&[u8]>,
     timeout: Option<Duration>,
     cancel: Option<&Cancel>,
+    mut watch: Option<Watch<'_>>,
     mut on_chunk: impl FnMut(u16, &[u8]),
 ) -> io::Result<u16> {
     let mut stream = UnixStream::connect(sock)?;
-    stream.set_read_timeout(timeout)?;
+    stream.set_read_timeout(timeout.or(watch.as_ref().map(|watch| watch.idle)))?;
     stream.set_write_timeout(timeout)?;
     if let Some(cancel) = cancel {
         cancel.attach(&stream)?;
@@ -125,7 +149,7 @@ fn exchange(
     let mut buf = vec![0u8; 64 * 1024];
     let mut pending = Vec::new();
     let (status, mut decoder, leftover) = loop {
-        let n = read_some(&mut stream, &mut buf, cancel)?;
+        let n = read_some(&mut stream, &mut buf, cancel, &mut watch)?;
         if n == 0 {
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "connection closed before response"));
         }
@@ -141,20 +165,31 @@ fn exchange(
         return Ok(status);
     }
     loop {
-        let n = read_some(&mut stream, &mut buf, cancel)?;
+        let n = read_some(&mut stream, &mut buf, cancel, &mut watch)?;
         if n == 0 || decoder.feed(&buf[..n], &mut sink) {
             return Ok(status);
         }
     }
 }
 
-fn read_some(stream: &mut UnixStream, buf: &mut [u8], cancel: Option<&Cancel>) -> io::Result<usize> {
+fn read_some(
+    stream: &mut UnixStream,
+    buf: &mut [u8],
+    cancel: Option<&Cancel>,
+    watch: &mut Option<Watch<'_>>,
+) -> io::Result<usize> {
     loop {
         match stream.read(buf) {
             // A signal is not the end of the response.
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             // A cancelled stream ending in a reset is the expected way out.
             Err(_) if cancel.is_some_and(Cancel::is_cancelled) => return Ok(0),
+            // A watched stream that went quiet carries on while the other end answers.
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if !watch.as_mut().is_some_and(|watch| (watch.alive)()) {
+                    return Err(e);
+                }
+            }
             other => return other,
         }
     }
@@ -336,6 +371,63 @@ mod tests {
         server.join().unwrap();
         assert_eq!((status, got.as_slice()), (200, &b"hello"[..]));
         assert!(!cancel.is_cancelled());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-connection server that reads the request, then runs `script`.
+    fn serve(
+        name: &str,
+        script: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+    ) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
+        let dir = std::env::temp_dir().join(format!("dp-http-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut request = [0u8; 256];
+            let _ = peer.read(&mut request);
+            script(peer);
+        });
+        (dir, server)
+    }
+
+    #[test]
+    fn a_watched_stream_waits_out_silence_while_the_other_end_answers() {
+        let (dir, server) = serve("quiet", |mut peer| {
+            peer.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            peer.write_all(b"late").unwrap();
+        });
+        let mut asked = 0;
+        let mut got = Vec::new();
+        let idle = Duration::from_millis(50);
+        let alive = || {
+            asked += 1;
+            true
+        };
+        let status = stream_watched(&dir.join("s"), "GET", "/", &Cancel::new(), idle, alive, |_, chunk| {
+            got.extend_from_slice(chunk);
+        })
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!((status, got.as_slice()), (200, &b"late"[..]));
+        assert!(asked >= 2, "asked {asked} times");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_watched_stream_gives_up_when_the_other_end_is_gone() {
+        let (dir, server) = serve("gone", |mut peer| {
+            peer.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+            let mut rest = [0u8; 16];
+            let _ = peer.read(&mut rest); // silent until the client leaves
+        });
+        let idle = Duration::from_millis(50);
+        let result = stream_watched(&dir.join("s"), "GET", "/", &Cancel::new(), idle, || false, |_, _| {});
+        assert!(result.is_err());
+        server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

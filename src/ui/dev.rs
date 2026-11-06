@@ -96,6 +96,8 @@ impl Controller {
             }),
             "click" => self.dev_click(argument),
             "sheet" => self.dev_sheet(argument),
+            "profiles" => self.dev_profiles(),
+            "profile" => self.dev_profile(argument),
             "filter" => {
                 self.toolbar.set_search_text(argument);
                 self.perform(Action::Filter);
@@ -160,7 +162,7 @@ impl Controller {
             }
             "fetches" => {
                 let counts: Vec<usize> = crate::backend::docker::FETCHES.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
-                json!({"containers": counts[0], "images": counts[1], "volumes": counts[2]}).to_string()
+                json!({"containers": counts[0], "images": counts[1], "volumes": counts[2], "networks": counts[3]}).to_string()
             }
             // Replacement characters in the log view: text damaged by decoding.
             "logbad" => self.logs.text.string().to_string().matches('\u{fffd}').count().to_string(),
@@ -216,6 +218,7 @@ impl Controller {
             Page::Containers => Some(&self.containers),
             Page::Images => Some(&self.images),
             Page::Volumes => Some(&self.volumes),
+            Page::Networks => Some(&self.networks),
             Page::Storage => Some(&self.storage),
         }
     }
@@ -226,7 +229,7 @@ impl Controller {
         let mut enabled = serde_json::Map::new();
         for name in [
             "ContainerStart", "ContainerStop", "ContainerRestart", "ShowLogs", "Pull", "Remove", "RunningOnly",
-            "ToggleStats", "Prune", "Refresh",
+            "ToggleStats", "Prune", "Refresh", "ComposeUp",
         ] {
             if let Some(item) = Action::from_name(name).and_then(|a| self.toolbar.item(a)) {
                 enabled.insert(name.into(), json!({"hidden": item.isHidden(), "enabled": item.isEnabled()}));
@@ -240,9 +243,11 @@ impl Controller {
             "colima_installed": st.info.as_ref().map(|i| i.installed),
             "colima_running": st.info.as_ref().map(|i| i.running),
             "colima_version": st.info.as_ref().map(|i| i.version.clone()),
+            "colima_profile": st.profile,
             "containers": st.containers.iter().map(|c| c.name()).collect::<Vec<_>>(),
             "images": st.images.len(),
             "volumes": st.volumes.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            "networks": st.networks.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
             "selected": self.dev_table().map(Table::selected_keys),
             "hud": {"summary": summary, "activity": activity, "stats": stats},
             "stats_on": st.stats_on,
@@ -311,6 +316,7 @@ impl Controller {
             "containers" => Action::ShowContainers,
             "images" => Action::ShowImages,
             "volumes" => Action::ShowVolumes,
+            "networks" => Action::ShowNetworks,
             "storage" => Action::ShowStorage,
             _ => return "unknown page".into(),
         };
@@ -348,6 +354,40 @@ impl Controller {
         "clicked".into()
     }
 
+    /// The profile menu as shown, and what is known about the current profile.
+    fn dev_profiles(&self) -> String {
+        let popup = &self.colima_page.profile;
+        let titles: Vec<String> = popup.itemTitles().iter().map(|t| t.to_string()).collect();
+        let st = self.st.borrow();
+        let settings = st.info.as_ref().and_then(|i| i.settings.as_ref());
+        json!({
+            "current": st.profile,
+            "menu": titles,
+            "selected": popup.titleOfSelectedItem().map(|t| t.to_string()),
+            "enabled": popup.isEnabled(),
+            "listed": st.info.as_ref().map(|i| i.profiles.clone()),
+            "settings": settings.map(|s| json!({
+                "vm_type": s.vm_type, "mount_type": s.mount_type, "rosetta": s.rosetta, "kubernetes": s.kubernetes,
+            })),
+        })
+        .to_string()
+    }
+
+    /// Picks a profile menu entry, "New Profile…" included, the way a click does.
+    fn dev_profile(&self, title: &str) -> String {
+        let popup = &self.colima_page.profile;
+        if popup.isHiddenOrHasHiddenAncestor() || !popup.isEnabled() {
+            return "refused: hidden or disabled".into();
+        }
+        if popup.itemWithTitle(&ns(title)).is_none() {
+            return "no such profile".into();
+        }
+        popup.selectItemWithTitle(&ns(title));
+        let app = NSApplication::sharedApplication(self.mtm);
+        let sent = unsafe { app.sendAction_to_from(popup.action().unwrap(), popup.target().as_deref(), Some(popup)) };
+        format!("sent={sent}")
+    }
+
     /// With no argument, lists the attached sheet; otherwise presses a button.
     fn dev_sheet(&self, argument: &str) -> String {
         let Some(sheet) = self.window.attachedSheet() else { return "no sheet".into() };
@@ -378,10 +418,15 @@ impl Controller {
         }
         if argument.is_empty() {
             let titles: Vec<String> = buttons.iter().map(|b| b.title().to_string()).collect();
+            let checked: Vec<String> = buttons
+                .iter()
+                .filter(|b| (*b).clone().downcast::<NSPopUpButton>().is_err() && b.state() == NSControlStateValueOn)
+                .map(|b| b.title().to_string())
+                .collect();
             let labels: Vec<String> = texts.iter().map(|t| t.stringValue().to_string()).collect();
             let mut documents = Vec::new();
             collect_documents(&root, &mut documents);
-            return json!({"buttons": titles, "text": labels, "documents": documents}).to_string();
+            return json!({"buttons": titles, "checked": checked, "text": labels, "documents": documents}).to_string();
         }
         match buttons.iter().find(|b| b.title().to_string() == argument) {
             Some(button) => {

@@ -11,6 +11,7 @@ pub enum Page {
     Containers,
     Images,
     Volumes,
+    Networks,
     Storage,
 }
 
@@ -21,6 +22,7 @@ impl Page {
             Self::Containers => "Containers",
             Self::Images => "Images",
             Self::Volumes => "Volumes",
+            Self::Networks => "Networks",
             Self::Storage => "Storage",
         }
     }
@@ -57,6 +59,15 @@ pub const VOLUME_COLUMNS: &[Column] = &[
     Column::new("Driver", 80.0, 50.0),
     Column::new("Size", 80.0, 50.0),
     Column::new("Used by", 180.0, 60.0),
+    Column::new("Created", 100.0, 60.0),
+];
+
+pub const NETWORK_COLUMNS: &[Column] = &[
+    Column::new("Name", 240.0, 110.0),
+    Column::new("Driver", 80.0, 50.0),
+    Column::new("Subnet", 140.0, 70.0).mono(),
+    Column::new("Containers", 80.0, 50.0),
+    Column::new("Project", 120.0, 60.0),
     Column::new("Created", 100.0, 60.0),
 ];
 
@@ -210,27 +221,85 @@ pub fn storage_summary(lines: &[StorageLine], on_mac: Option<u64>) -> String {
     text
 }
 
-/// Title and details for the confirmation before pruning.
-pub fn prune_prompt(line: &StorageLine) -> (String, String) {
-    let unused = line.items.saturating_sub(line.active);
-    let size = human_size(line.reclaimable);
-    match line.kind {
+/// Title and details for the confirmation before pruning, naming what goes.
+/// None when there is nothing to remove.
+pub fn prune_prompt(kind: Prune, preview: &PrunePreview) -> Option<(String, String)> {
+    let count = preview.items.len();
+    let size = human_size(preview.size);
+    let list = name_list(&preview.items);
+    let prompt = match kind {
+        _ if count == 0 && kind != Prune::BuildCache => return None,
+        Prune::BuildCache if preview.size <= 0 => return None,
         Prune::Containers => (
             "Remove stopped containers?".to_string(),
-            format!("{unused} stopped {}, {size}.", plural(unused, "container")),
+            format!("{count} stopped {}, {size}:\n{list}", plural(count, "container")),
         ),
         Prune::Images => (
             "Remove unused images?".to_string(),
-            format!("{unused} {} no container uses, tagged ones included, {size}. They can be pulled again.", plural(unused, "image")),
+            format!(
+                "{count} {} no container uses, tagged ones included, {size}:\n{list}\n\nThey can be pulled again.",
+                plural(count, "image")
+            ),
         ),
         Prune::Volumes => (
             "Remove unused volumes?".to_string(),
-            format!("{unused} {} no container uses, {size}. Their data cannot be recovered.", plural(unused, "volume")),
+            format!(
+                "{count} {} no container uses, named ones included, {size}:\n{list}\n\nTheir data cannot be recovered.",
+                plural(count, "volume")
+            ),
         ),
-        Prune::BuildCache => (
-            "Clear the build cache?".to_string(),
-            format!("{size}. The next builds will take longer."),
-        ),
+        Prune::BuildCache => {
+            ("Clear the build cache?".to_string(), format!("{size}. The next builds will take longer."))
+        }
+    };
+    Some(prompt)
+}
+
+/// What to say when a prune would remove nothing.
+pub fn prune_nothing(kind: Prune) -> (String, String) {
+    let detail = match kind {
+        Prune::Containers => "No container is stopped.",
+        Prune::Images => "Every image is used by a container.",
+        Prune::Volumes => "Every volume is used by a container.",
+        Prune::BuildCache => "The build cache is empty.",
+    };
+    ("Nothing to remove".to_string(), detail.to_string())
+}
+
+/// A bulleted list for a prompt, sizes where known, the long tail summed up.
+fn name_list(items: &[(String, Option<i64>)]) -> String {
+    const SHOWN: usize = 8;
+    let mut lines: Vec<String> = items
+        .iter()
+        .take(SHOWN)
+        .map(|(name, size)| match size {
+            Some(bytes) if *bytes > 0 => format!("• {name} ({})", human_size(*bytes)),
+            _ => format!("• {name}"),
+        })
+        .collect();
+    if items.len() > SHOWN {
+        lines.push(format!("• and {} more", items.len() - SHOWN));
+    }
+    lines.join("\n")
+}
+
+/// One message for a batch in which every item was tried. A lone item keeps
+/// the engine's own words; a batch names each item that failed and why.
+pub fn batch_error(total: usize, failures: &[(String, String)]) -> Option<String> {
+    const SHOWN: usize = 6;
+    match failures {
+        [] => None,
+        [(_, error)] if total == 1 => Some(error.clone()),
+        _ => {
+            let mut text = format!("{} of {total} could not be done:", failures.len());
+            for (name, error) in failures.iter().take(SHOWN) {
+                text.push_str(&format!("\n• {name}: {error}"));
+            }
+            if failures.len() > SHOWN {
+                text.push_str(&format!("\n• and {} more", failures.len() - SHOWN));
+            }
+            Some(text)
+        }
     }
 }
 
@@ -324,6 +393,48 @@ pub fn images_summary(images: &[Image]) -> String {
 
 pub fn volumes_summary(volumes: &[Volume]) -> String {
     format!("{} {}", volumes.len(), plural(volumes.len(), "volume"))
+}
+
+/// Keyed by ID: Docker allows two networks with one name.
+pub fn network_rows(networks: &[Network], containers: &[Container], now: i64) -> Vec<Row> {
+    networks
+        .iter()
+        .map(|n| {
+            let users = containers.iter().filter(|c| c.uses_network(n)).count();
+            let created = parse_rfc3339(&n.created).unwrap_or(0);
+            Row::new(n.id.clone(), vec![
+                Cell::text(&n.name),
+                Cell::dim(&n.driver),
+                Cell::dim(&n.subnets()),
+                Cell::dim(&if users == 0 { String::new() } else { users.to_string() }).sorted_by(users as i64),
+                Cell::dim(n.project()),
+                Cell::dim(&relative_time(now, created)).sorted_by(created),
+            ])
+        })
+        .collect()
+}
+
+pub fn networks_summary(networks: &[Network]) -> String {
+    format!("{} {}", networks.len(), plural(networks.len(), "network"))
+}
+
+/// Networks someone made that no container, running or stopped, is attached
+/// to. Chosen here rather than by the engine's prune, so the confirmation can
+/// name exactly what goes.
+pub fn unused_networks<'a>(networks: &'a [Network], containers: &[Container]) -> Vec<&'a Network> {
+    networks
+        .iter()
+        .filter(|n| !n.is_builtin() && !containers.iter().any(|c| c.uses_network(n)))
+        .collect()
+}
+
+/// Title and details for removing the unused networks, naming each one.
+pub fn network_prune_prompt(unused: &[&Network]) -> (String, String) {
+    let items: Vec<(String, Option<i64>)> = unused.iter().map(|n| (n.name.clone(), None)).collect();
+    (
+        format!("Remove {} unused {}?", unused.len(), plural(unused.len(), "network")),
+        format!("{}\n\nNo container, running or stopped, is attached to them.", name_list(&items)),
+    )
 }
 
 pub fn plural(count: usize, noun: &str) -> String {
@@ -519,9 +630,40 @@ mod tests {
 
     #[test]
     fn volume_prompts_warn_about_data() {
-        let line = StorageLine { kind: Prune::Volumes, items: 3, active: 1, size: 0, reclaimable: 1_000 };
-        assert!(prune_prompt(&line).1.starts_with("2 volumes"));
-        assert!(prune_prompt(&line).1.contains("cannot be recovered"));
+        let preview = PrunePreview { items: vec![("data".into(), Some(1_000)), ("cache".into(), Some(0))], size: 1_000 };
+        let (title, detail) = prune_prompt(Prune::Volumes, &preview).unwrap();
+        assert_eq!(title, "Remove unused volumes?");
+        assert!(detail.starts_with("2 volumes no container uses, named ones included, 1.0 KB:\n• data (1.0 KB)\n• cache\n"));
+        assert!(detail.contains("cannot be recovered"));
+    }
+
+    #[test]
+    fn prompts_name_the_first_few_and_count_the_rest() {
+        let items: Vec<(String, Option<i64>)> = (1..=11).map(|n| (format!("img{n}"), None)).collect();
+        let (_, detail) = prune_prompt(Prune::Images, &PrunePreview { items, size: 5 }).unwrap();
+        assert!(detail.contains("• img8\n• and 3 more"));
+        assert!(!detail.contains("img9"));
+    }
+
+    #[test]
+    fn nothing_to_prune_asks_nothing() {
+        assert_eq!(prune_prompt(Prune::Volumes, &PrunePreview::default()), None);
+        assert_eq!(prune_prompt(Prune::BuildCache, &PrunePreview::default()), None);
+        let cache = PrunePreview { items: Vec::new(), size: 2_000 };
+        assert_eq!(prune_prompt(Prune::BuildCache, &cache).unwrap().0, "Clear the build cache?");
+    }
+
+    #[test]
+    fn a_batch_reports_every_failure() {
+        let failure = |name: &str| (name.to_string(), format!("{name} is in use"));
+        assert_eq!(batch_error(3, &[]), None);
+        assert_eq!(batch_error(1, &[failure("a")]), Some("a is in use".to_string()));
+        assert_eq!(
+            batch_error(5, &[failure("a"), failure("c")]),
+            Some("2 of 5 could not be done:\n• a: a is in use\n• c: c is in use".to_string())
+        );
+        let many: Vec<_> = (0..9).map(|n| failure(&format!("v{n}"))).collect();
+        assert!(batch_error(9, &many).unwrap().ends_with("• v5: v5 is in use\n• and 3 more"));
     }
 
     #[test]
@@ -576,6 +718,35 @@ mod tests {
     fn summaries_handle_singular() {
         assert_eq!(containers_summary(&[container("a", "running", "Up")]), "1 container, 1 running");
         assert_eq!(volumes_summary(&[]), "0 volumes");
+        assert_eq!(networks_summary(&[Network::default()]), "1 network");
+    }
+
+    fn network(name: &str) -> Network {
+        Network { name: name.into(), id: format!("id-{name}"), ..Default::default() }
+    }
+
+    fn attach(c: &mut Container, n: &Network) {
+        let endpoint = Endpoint { network_id: n.id.clone(), ..Default::default() };
+        c.network_settings.networks.insert(n.name.clone(), endpoint);
+    }
+
+    #[test]
+    fn networks_count_attached_containers_running_or_not() {
+        let networks = [network("bridge"), network("shop_default"), network("spare")];
+        let mut web = container("web", "running", "Up");
+        let mut db = container("db", "exited", "Exited (0)");
+        attach(&mut web, &networks[1]);
+        attach(&mut db, &networks[1]);
+        let rows = network_rows(&networks, &[web.clone(), db.clone()], 100);
+        assert_eq!(rows[1].key, "id-shop_default");
+        assert_eq!(rows[1].cells[3].text, "2");
+        assert_eq!(rows[2].cells[3].text, "");
+
+        let unused: Vec<&str> = unused_networks(&networks, &[web, db]).iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(unused, ["spare"]);
+        let (title, detail) = network_prune_prompt(&[&networks[2]]);
+        assert_eq!(title, "Remove 1 unused network?");
+        assert!(detail.starts_with("• spare\n"));
     }
 
     #[test]

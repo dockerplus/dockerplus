@@ -50,5 +50,9 @@ ditto target/DockerPlus.app "$apps/DockerPlus.app"
 # command keeps working if this source folder moves or goes away.
 ln -sf "$apps/DockerPlus.app/Contents/Resources/dockerplus" "$(brew --prefix)/bin/dockerplus"
 
+# "Check for Updates…" pulls from here. Kept in defaults: changing a file inside
+# the signed bundle would break its ad-hoc signature.
+defaults write local.dockerplus.app DPSourceDirectory "$(pwd -P)"
+
 open "$apps/DockerPlus.app"
 echo "Installed $apps/DockerPlus.app and the dockerplus command."

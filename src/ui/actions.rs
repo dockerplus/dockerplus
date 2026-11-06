@@ -48,6 +48,7 @@ actions! {
     ShowImages = 32,
     ShowVolumes = 33,
     ShowStorage = 34,
+    ShowNetworks = 35,
     LogsFollow = 40,
     LogsClear = 41,
     LogsClose = 42,
@@ -61,6 +62,10 @@ actions! {
     SelectProject = 56,
     RunningOnly = 57,
     ToggleStats = 58,
+    ColimaProfile = 60,
+    ColimaNewProfile = 61,
+    ComposeUp = 70,
+    CheckUpdates = 80,
 }
 
 define_class!(

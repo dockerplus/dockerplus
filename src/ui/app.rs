@@ -106,6 +106,7 @@ fn main_menu(mtm: MainThreadMarker, actions: &Actions) -> Retained<NSMenu> {
     hide_others.setKeyEquivalentModifierMask(NSEventModifierFlags::Option | NSEventModifierFlags::Command);
     submenu(mtm, &bar, "DockerPlus", &[
         item(mtm, "About DockerPlus", Some(sel!(orderFrontStandardAboutPanel:)), ""),
+        action_item(mtm, actions, "Check for Updates…", Action::CheckUpdates, ""),
         separator(),
         item(mtm, "Hide DockerPlus", Some(sel!(hide:)), "h"),
         hide_others,
@@ -113,6 +114,8 @@ fn main_menu(mtm: MainThreadMarker, actions: &Actions) -> Retained<NSMenu> {
         separator(),
         item(mtm, "Quit DockerPlus", Some(sel!(terminate:)), "q"),
     ]);
+
+    submenu(mtm, &bar, "File", &[action_item(mtm, actions, "Compose Up…", Action::ComposeUp, "o")]);
 
     // Text fields only get copy and paste through these menu items.
     submenu(mtm, &bar, "Edit", &[
@@ -132,7 +135,8 @@ fn main_menu(mtm: MainThreadMarker, actions: &Actions) -> Retained<NSMenu> {
         action_item(mtm, actions, "Containers", Action::ShowContainers, "2"),
         action_item(mtm, actions, "Images", Action::ShowImages, "3"),
         action_item(mtm, actions, "Volumes", Action::ShowVolumes, "4"),
-        action_item(mtm, actions, "Storage", Action::ShowStorage, "5"),
+        action_item(mtm, actions, "Networks", Action::ShowNetworks, "5"),
+        action_item(mtm, actions, "Storage", Action::ShowStorage, "6"),
         separator(),
         action_item(mtm, actions, "Show Logs", Action::ShowLogs, "l"),
         action_item(mtm, actions, "CPU and Memory", Action::ToggleStats, "M"),

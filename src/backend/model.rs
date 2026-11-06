@@ -31,6 +31,9 @@ pub struct Container {
     pub mounts: Vec<Mount>,
     #[serde(deserialize_with = "null_default")]
     pub labels: HashMap<String, String>,
+    /// Only `networks` is filled in here: the list leaves out ports.
+    #[serde(deserialize_with = "null_default")]
+    pub network_settings: NetworkSettings,
 }
 
 impl Container {
@@ -44,6 +47,14 @@ impl Container {
 
     pub fn project(&self) -> &str {
         self.labels.get("com.docker.compose.project").map_or("", String::as_str)
+    }
+
+    /// Stopped containers stay attached, so they count too.
+    pub fn uses_network(&self, network: &Network) -> bool {
+        self.network_settings
+            .networks
+            .iter()
+            .any(|(name, endpoint)| endpoint.network_id == network.id || (endpoint.network_id.is_empty() && *name == network.name))
     }
 }
 
@@ -100,6 +111,49 @@ pub struct VolumeList {
     pub volumes: Vec<Volume>,
 }
 
+/// `GET /networks`.
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct Network {
+    pub name: String,
+    pub id: String,
+    pub created: String,
+    pub driver: String,
+    #[serde(rename = "IPAM")]
+    pub ipam: Ipam,
+    #[serde(deserialize_with = "null_default")]
+    pub labels: HashMap<String, String>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct Ipam {
+    #[serde(deserialize_with = "null_default")]
+    pub config: Vec<IpamConfig>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct IpamConfig {
+    pub subnet: String,
+}
+
+impl Network {
+    /// The engine's own networks, which it refuses to remove.
+    pub fn is_builtin(&self) -> bool {
+        matches!(self.name.as_str(), "bridge" | "host" | "none")
+    }
+
+    pub fn project(&self) -> &str {
+        self.labels.get("com.docker.compose.project").map_or("", String::as_str)
+    }
+
+    pub fn subnets(&self) -> String {
+        let subnets: Vec<&str> = self.ipam.config.iter().map(|c| c.subnet.as_str()).filter(|s| !s.is_empty()).collect();
+        subnets.join(", ")
+    }
+}
+
 /// `GET /system/df`. The summaries are the engine's own, the same numbers
 /// `docker system df` prints; shared layers make them hard to reckon from outside.
 #[derive(Deserialize, Default)]
@@ -111,6 +165,10 @@ pub struct DiskUsage {
     pub build_cache_usage: UsageSummary,
     #[serde(deserialize_with = "null_default")]
     pub volumes: Vec<VolumeUsage>,
+    #[serde(deserialize_with = "null_default")]
+    pub images: Vec<ImageUsage>,
+    #[serde(deserialize_with = "null_default")]
+    pub containers: Vec<ContainerUsage>,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -134,6 +192,41 @@ pub struct VolumeUsage {
 pub struct UsageData {
     pub size: i64,
     pub ref_count: i64,
+}
+
+/// One image as `/system/df` lists it, with the containers that use it.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ImageUsage {
+    pub id: String,
+    #[serde(deserialize_with = "null_default")]
+    pub repo_tags: Vec<String>,
+    pub containers: i64,
+}
+
+/// One container as `/system/df` lists it. `SizeRw` is what removing it frees.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ContainerUsage {
+    #[serde(deserialize_with = "null_default")]
+    pub names: Vec<String>,
+    pub state: String,
+    pub size_rw: i64,
+}
+
+impl ContainerUsage {
+    /// What a container prune takes: anything not running, paused or restarting.
+    fn is_stopped(&self) -> bool {
+        matches!(self.state.as_str(), "created" | "exited" | "dead")
+    }
+}
+
+/// What a prune would remove right now: names, with the space each frees where
+/// that is known, and the total.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrunePreview {
+    pub items: Vec<(String, Option<i64>)>,
+    pub size: i64,
 }
 
 /// What can be pruned.
@@ -167,6 +260,8 @@ pub struct StorageLine {
 }
 
 impl DiskUsage {
+    /// Newer engines leave a few figures out of their summaries: active
+    /// containers and what volumes could free. Those come from the lists then.
     pub fn lines(&self) -> Vec<StorageLine> {
         let line = |kind, usage: UsageSummary| StorageLine {
             kind,
@@ -175,12 +270,60 @@ impl DiskUsage {
             size: usage.total_size,
             reclaimable: usage.reclaimable,
         };
+        let mut containers = line(Prune::Containers, self.container_usage);
+        let in_use = self.containers.iter().filter(|c| !c.is_stopped()).count();
+        containers.active = containers.active.max(in_use);
+        let mut volumes = line(Prune::Volumes, self.volume_usage);
+        volumes.reclaimable = volumes.reclaimable.max(self.preview(Prune::Volumes).size);
         vec![
-            line(Prune::Containers, self.container_usage),
+            containers,
             line(Prune::Images, self.image_usage),
-            line(Prune::Volumes, self.volume_usage),
+            volumes,
             line(Prune::BuildCache, self.build_cache_usage),
         ]
+    }
+
+    /// What pruning `kind` would remove, read from a `/system/df` of that kind.
+    pub fn preview(&self, kind: Prune) -> PrunePreview {
+        match kind {
+            Prune::Containers => {
+                let stopped: Vec<&ContainerUsage> = self.containers.iter().filter(|c| c.is_stopped()).collect();
+                PrunePreview {
+                    items: stopped.iter().map(|c| (container_label(c), Some(c.size_rw))).collect(),
+                    size: stopped.iter().map(|c| c.size_rw.max(0)).sum(),
+                }
+            }
+            // Images share layers, so one image's size says little about what
+            // removing it frees; only the engine's total is given.
+            Prune::Images => PrunePreview {
+                items: self.images.iter().filter(|i| i.containers == 0).map(|i| (image_label(i), None)).collect(),
+                size: self.image_usage.reclaimable,
+            },
+            Prune::Volumes => {
+                let unused: Vec<(&str, i64)> = self
+                    .volumes
+                    .iter()
+                    .filter_map(|v| v.usage_data.filter(|u| u.ref_count == 0).map(|u| (v.name.as_str(), u.size)))
+                    .collect();
+                PrunePreview {
+                    items: unused.iter().map(|(name, size)| (name.to_string(), Some(*size))).collect(),
+                    size: unused.iter().map(|(_, size)| size.max(&0)).sum(),
+                }
+            }
+            Prune::BuildCache => PrunePreview { items: Vec::new(), size: self.build_cache_usage.reclaimable },
+        }
+    }
+}
+
+fn container_label(container: &ContainerUsage) -> String {
+    container.names.first().map_or("<unnamed>", |name| name.trim_start_matches('/')).to_string()
+}
+
+fn image_label(image: &ImageUsage) -> String {
+    match image.repo_tags.first() {
+        Some(tag) if image.repo_tags.len() > 1 => format!("{tag} (+{} tags)", image.repo_tags.len() - 1),
+        Some(tag) => tag.clone(),
+        None => format!("<none> {}", short_id(&image.id)),
     }
 }
 
@@ -350,6 +493,8 @@ pub struct PortBinding {
 pub struct Endpoint {
     #[serde(rename = "IPAddress")]
     pub ip_address: String,
+    #[serde(rename = "NetworkID")]
+    pub network_id: String,
 }
 
 /// `colima status --json`.
@@ -510,6 +655,26 @@ mod tests {
     }
 
     #[test]
+    fn networks_and_their_containers() {
+        let json = r#"[{"Name":"shop_default","Id":"n1","Created":"2026-10-22T03:44:17.988366422Z","Driver":"bridge",
+            "IPAM":{"Driver":"default","Options":null,"Config":[{"Subnet":"172.18.0.0/16","Gateway":"172.18.0.1"}]},
+            "Labels":{"com.docker.compose.project":"shop"}},
+            {"Name":"host","Id":"n2","Driver":"host","IPAM":{"Config":null},"Labels":{}}]"#;
+        let networks: Vec<Network> = serde_json::from_str(json).unwrap();
+        assert_eq!((networks[0].subnets(), networks[0].project()), ("172.18.0.0/16".to_string(), "shop"));
+        assert_eq!(networks[1].subnets(), "");
+        assert!(networks[1].is_builtin() && !networks[0].is_builtin());
+
+        let c: Container = serde_json::from_str(
+            r#"{"Id":"c","State":"exited","NetworkSettings":{"Networks":{"shop_default":{"NetworkID":"n1","IPAddress":""}}}}"#,
+        )
+        .unwrap();
+        assert!(c.uses_network(&networks[0]) && !c.uses_network(&networks[1]));
+        let bare: Container = serde_json::from_str(r#"{"Id":"d","NetworkSettings":null}"#).unwrap();
+        assert!(!bare.uses_network(&networks[0]));
+    }
+
+    #[test]
     fn image_with_null_tags_is_dangling() {
         let i: Image = serde_json::from_str(r#"{"Id":"sha256:abcdef0123456789","RepoTags":null,"Created":1,"Size":1000}"#).unwrap();
         assert!(i.repo_tags.is_empty());
@@ -535,6 +700,41 @@ mod tests {
         assert_eq!((lines[0].items, lines[0].active, lines[0].size), (2, 0, 8));
         assert_eq!(lines[2].items, 0);
         assert_eq!(lines[3].size, 7);
+    }
+
+    /// The shape Docker Engine 29.9 sends: no active count for containers and
+    /// nothing reclaimable for volumes in the summaries.
+    #[test]
+    fn missing_summary_figures_come_from_the_lists() {
+        let json = r#"{"ContainerUsage":{"Reclaimable":5,"TotalCount":2,"TotalSize":9},
+            "VolumeUsage":{"ActiveCount":1,"TotalCount":3,"TotalSize":700},
+            "Containers":[{"Names":["/web"],"State":"running","SizeRw":4},{"Names":["/old"],"State":"exited","SizeRw":5}],
+            "Volumes":[{"Name":"used","UsageData":{"RefCount":1,"Size":100}},
+                       {"Name":"data","UsageData":{"RefCount":0,"Size":500}},
+                       {"Name":"empty","UsageData":{"RefCount":0,"Size":-1}}]}"#;
+        let usage: DiskUsage = serde_json::from_str(json).unwrap();
+        let lines = usage.lines();
+        assert_eq!(lines[0].active, 1);
+        assert_eq!(lines[2].reclaimable, 500);
+    }
+
+    #[test]
+    fn previews_name_what_a_prune_takes() {
+        let json = r#"{"ImageUsage":{"Reclaimable":300},
+            "Images":[{"Id":"sha256:aaaaaaaaaaaaaaaa","RepoTags":["nginx:alpine","web:1"],"Containers":0},
+                      {"Id":"sha256:bbbbbbbbbbbbbbbb","RepoTags":null,"Containers":0},
+                      {"Id":"sha256:cccccccccccccccc","RepoTags":["db:16"],"Containers":2}],
+            "Containers":[{"Names":["/old"],"State":"exited","SizeRw":5},{"Names":["/up"],"State":"paused","SizeRw":7}],
+            "Volumes":[{"Name":"data","UsageData":{"RefCount":0,"Size":500}},{"Name":"used","UsageData":{"RefCount":2,"Size":9}}]}"#;
+        let usage: DiskUsage = serde_json::from_str(json).unwrap();
+
+        let images = usage.preview(Prune::Images);
+        let names: Vec<&str> = images.items.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["nginx:alpine (+1 tags)", "<none> bbbbbbbbbbbb"]);
+        assert_eq!(images.size, 300);
+        assert_eq!(usage.preview(Prune::Containers).items, [("old".to_string(), Some(5))]);
+        assert_eq!(usage.preview(Prune::Volumes), PrunePreview { items: vec![("data".into(), Some(500))], size: 500 });
+        assert!(usage.preview(Prune::BuildCache).items.is_empty());
     }
 
     #[test]

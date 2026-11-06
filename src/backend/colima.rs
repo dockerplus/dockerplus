@@ -46,7 +46,42 @@ pub struct ColimaInfo {
     pub provisioned: bool,
     pub status: Option<ColimaStatus>,
     pub profile: Option<ColimaProfile>,
+    /// Every profile with a VM, as `colima list` names them.
+    pub profiles: Vec<String>,
+    /// From the profile's config file, so known while the VM is stopped too.
+    pub settings: Option<VmSettings>,
 }
+
+/// The parts of a profile's `colima.yaml` the app shows or changes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VmSettings {
+    pub vm_type: String,
+    pub mount_type: String,
+    pub rosetta: bool,
+    pub kubernetes: bool,
+}
+
+/// A VM type with a mount type it supports, offered together so that no
+/// pair Colima would quietly swap for another can be picked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VmKind {
+    pub vm_type: &'static str,
+    pub mount_type: &'static str,
+    pub title: &'static str,
+}
+
+/// The first is Colima's own default on macOS 13 and later.
+pub const VM_KINDS: [VmKind; 4] = [
+    VmKind { vm_type: "vz", mount_type: "virtiofs", title: "VZ with virtiofs" },
+    VmKind { vm_type: "vz", mount_type: "sshfs", title: "VZ with sshfs" },
+    VmKind { vm_type: "qemu", mount_type: "sshfs", title: "QEMU with sshfs" },
+    VmKind { vm_type: "qemu", mount_type: "9p", title: "QEMU with 9p" },
+];
+
+pub const DEFAULT_PROFILE: &str = "default";
+/// Lima keeps sockets under a path that holds the name, and macOS caps a
+/// socket path at 104 bytes.
+const PROFILE_NAME_MAX: usize = 30;
 
 /// VM size in whole CPUs and GiB, as `colima start` takes it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -68,6 +103,11 @@ pub struct ResourceChange {
     pub cpus: Option<u32>,
     pub memory: Option<u32>,
     pub disk: Option<u32>,
+    /// Only for a new VM: Colima fixes both when it creates one.
+    pub vm_type: Option<&'static str>,
+    pub mount_type: Option<&'static str>,
+    pub rosetta: Option<bool>,
+    pub kubernetes: Option<bool>,
 }
 
 impl ResourceChange {
@@ -75,12 +115,40 @@ impl ResourceChange {
     /// disk only ever grows, whatever was asked for.
     pub fn between(current: Option<Resources>, wanted: Resources) -> Self {
         let Some(current) = current else {
-            return Self { cpus: Some(wanted.cpus), memory: Some(wanted.memory), disk: Some(wanted.disk) };
+            return Self {
+                cpus: Some(wanted.cpus),
+                memory: Some(wanted.memory),
+                disk: Some(wanted.disk),
+                ..Self::default()
+            };
         };
         Self {
             cpus: (wanted.cpus != current.cpus).then_some(wanted.cpus),
             memory: (wanted.memory != current.memory).then_some(wanted.memory),
             disk: (wanted.disk > current.disk).then_some(wanted.disk),
+            ..Self::default()
+        }
+    }
+
+    /// Adds the switches that differ from `current`, where unknown means
+    /// Colima's defaults. Rosetta only exists for vz VMs.
+    pub fn with_switches(mut self, current: Option<&VmSettings>, rosetta: bool, kubernetes: bool) -> Self {
+        let current = current.cloned().unwrap_or_default();
+        let vz = matches!(current.vm_type.as_str(), "vz" | "");
+        self.rosetta = (vz && rosetta != current.rosetta).then_some(rosetta);
+        self.kubernetes = (kubernetes != current.kubernetes).then_some(kubernetes);
+        self
+    }
+
+    /// Everything for a VM that does not exist yet. Rosetta is only ever
+    /// switched on: Colima knows the flag on Apple silicon alone.
+    pub fn new_vm(size: Resources, kind: VmKind, rosetta: bool, kubernetes: bool) -> Self {
+        Self {
+            vm_type: Some(kind.vm_type),
+            mount_type: Some(kind.mount_type),
+            rosetta: (rosetta && kind.vm_type == "vz").then_some(true),
+            kubernetes: Some(kubernetes),
+            ..Self::between(None, size)
         }
     }
 
@@ -122,6 +190,16 @@ impl Colima {
         find_tool("colima").map(|bin| Self { bin, profile: profile.to_string() })
     }
 
+    /// The same tool for another profile. Work already handed a clone stays on
+    /// the profile it began with.
+    pub fn with_profile(&self, profile: &str) -> Self {
+        Self { bin: self.bin.clone(), profile: profile.to_string() }
+    }
+
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
     pub fn default_socket(profile: &str) -> PathBuf {
         colima_home().join(profile).join("docker.sock")
     }
@@ -147,11 +225,13 @@ impl Colima {
             .filter(|out| out.status.success())
             .and_then(|out| serde_json::from_slice::<ColimaStatus>(&out.stdout).ok());
 
-        let profile = self
+        let listed = self
             .command(&["list", "--json"])
             .output()
             .ok()
-            .and_then(|out| parse_profile(&String::from_utf8_lossy(&out.stdout), &self.profile));
+            .map(|out| parse_profiles(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or_default();
+        let profile = listed.iter().find(|p| p.name == self.profile).cloned();
 
         ColimaInfo {
             installed: true,
@@ -160,6 +240,8 @@ impl Colima {
             provisioned: profile.is_some() || status.is_some(),
             status,
             profile,
+            profiles: listed.into_iter().map(|p| p.name).collect(),
+            settings: read_settings(&self.profile),
         }
     }
 
@@ -222,15 +304,114 @@ fn start_args(profile: &str, change: ResourceChange) -> Vec<String> {
             args.push(value.to_string());
         }
     }
+    for (flag, value) in [("--vm-type", change.vm_type), ("--mount-type", change.mount_type)] {
+        if let Some(value) = value {
+            args.push(flag.to_string());
+            args.push(value.to_string());
+        }
+    }
+    // Spelled with `=`: a bare boolean flag can only switch something on.
+    for (flag, value) in [("--vz-rosetta", change.rosetta), ("--kubernetes", change.kubernetes)] {
+        if let Some(on) = value {
+            args.push(format!("{flag}={on}"));
+        }
+    }
     args
 }
 
 /// Bytes the VM's data disk really takes on the Mac. The file is sparse, so its
 /// length says nothing; the blocks it occupies do.
-pub fn disk_on_mac() -> Option<u64> {
+pub fn disk_on_mac(profile: &str) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
-    let disk = colima_home().join("_lima/_disks/colima/datadisk");
+    let disk = colima_home().join("_lima/_disks").join(lima_instance(profile)).join("datadisk");
     fs::metadata(disk).ok().map(|meta| meta.blocks() * 512)
+}
+
+/// Lima's name for a profile's VM, which also names its data disk. Mirrors
+/// `ProfileFromName` in Colima's config/profile.go.
+fn lima_instance(profile: &str) -> String {
+    match profile {
+        "" | "colima" | DEFAULT_PROFILE => "colima".to_string(),
+        name => format!("colima-{}", name.strip_prefix("colima-").unwrap_or(name)),
+    }
+}
+
+/// What the profile's config says. Colima fixes the VM and mount type when it
+/// creates the VM and keeps them in the instance's own copy, which wins over
+/// any later edit of the config.
+fn read_settings(profile: &str) -> Option<VmSettings> {
+    let home = colima_home();
+    let read = |path: PathBuf| fs::read_to_string(path).ok().map(|text| parse_settings(&text));
+    let fixed = read(home.join("_lima").join(lima_instance(profile)).join("colima.yaml"));
+    let mut settings = read(home.join(profile).join("colima.yaml")).or_else(|| fixed.clone())?;
+    if let Some(fixed) = fixed {
+        if !fixed.vm_type.is_empty() {
+            settings.vm_type = fixed.vm_type;
+        }
+        if !fixed.mount_type.is_empty() {
+            settings.mount_type = fixed.mount_type;
+        }
+    }
+    Some(settings)
+}
+
+/// Reads the few keys we need from Colima's YAML, which is flat but for
+/// `kubernetes.enabled`. Missing keys keep Colima's defaults: `rosetta` is
+/// left out when false.
+fn parse_settings(text: &str) -> VmSettings {
+    let mut settings = VmSettings::default();
+    let mut section = "";
+    for line in text.lines() {
+        let line = line.split(" #").next().unwrap_or("");
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let nested = line.starts_with([' ', '\t']);
+        let key = key.trim();
+        let value = value.trim().trim_matches(['"', '\'']);
+        if !nested {
+            section = key;
+        }
+        match (nested, section, key) {
+            (false, _, "vmType") => settings.vm_type = value.to_string(),
+            (false, _, "mountType") => settings.mount_type = value.to_string(),
+            (false, _, "rosetta") => settings.rosetta = value == "true",
+            (true, "kubernetes", "enabled") => settings.kubernetes = value == "true",
+            _ => {}
+        }
+    }
+    settings
+}
+
+/// What the profile menu offers: default first, the rest by name, and the
+/// current one even before its VM exists.
+pub fn profile_choices(listed: &[String], current: &str) -> Vec<String> {
+    let mut names: Vec<String> =
+        listed.iter().map(String::as_str).chain([current]).filter(|n| *n != DEFAULT_PROFILE).map(String::from).collect();
+    names.sort();
+    names.dedup();
+    names.insert(0, DEFAULT_PROFILE.to_string());
+    names
+}
+
+/// Why `name` cannot be a new profile, if it cannot. Lima allows letters and
+/// digits joined by single separators, and Colima reads `colima` and names
+/// starting `colima-` as other profiles.
+pub fn profile_name_problem(name: &str, existing: &[String]) -> Option<String> {
+    let pieces_ok = name.split(['-', '_']).all(|piece| !piece.is_empty() && piece.chars().all(|c| c.is_ascii_alphanumeric()));
+    let problem = if name.is_empty() {
+        "Enter a name for the profile.".to_string()
+    } else if !pieces_ok {
+        "Use letters and digits, joined by single “-” or “_”.".to_string()
+    } else if name.len() > PROFILE_NAME_MAX {
+        format!("Use at most {PROFILE_NAME_MAX} characters.")
+    } else if name == "colima" || name.starts_with("colima-") {
+        "Colima reserves “colima” and names starting with “colima-”.".to_string()
+    } else if name == DEFAULT_PROFILE || existing.iter().any(|e| e.eq_ignore_ascii_case(name)) {
+        // Case-insensitive, like the Mac's file system that holds the profiles.
+        format!("A profile named “{name}” already exists.")
+    } else {
+        return None;
+    };
+    Some(problem)
 }
 
 /// Reads `free -b`: "Mem: total used free shared buff/cache available". Used here
@@ -323,10 +504,8 @@ fn parse_version(text: &str) -> Option<String> {
     line.rsplit(' ').next().map(str::to_string)
 }
 
-fn parse_profile(text: &str, name: &str) -> Option<ColimaProfile> {
-    text.lines()
-        .filter_map(|line| serde_json::from_str::<ColimaProfile>(line).ok())
-        .find(|p| p.name == name)
+fn parse_profiles(text: &str) -> Vec<ColimaProfile> {
+    text.lines().filter_map(|line| serde_json::from_str::<ColimaProfile>(line).ok()).collect()
 }
 
 fn is_failure_line(line: &str) -> bool {
@@ -371,11 +550,74 @@ mod tests {
     fn every_start_refuses_to_change_the_docker_context() {
         let plain = ["start", "--activate=false", "--profile", "default"];
         assert_eq!(start_args("default", ResourceChange::default()), plain);
-        let everything = ResourceChange { cpus: Some(4), memory: Some(8), disk: Some(120) };
+        let everything = ResourceChange { cpus: Some(4), memory: Some(8), disk: Some(120), ..Default::default() };
         assert_eq!(
             start_args("default", everything),
             ["start", "--activate=false", "--profile", "default", "--cpus", "4", "--memory", "8", "--disk", "120"]
         );
+    }
+
+    #[test]
+    fn a_new_vm_names_its_type_and_mount() {
+        let kind = VM_KINDS[0];
+        let args = start_args("dev", ResourceChange::new_vm(Resources::DEFAULT, kind, true, false));
+        assert_eq!(
+            args,
+            [
+                "start", "--activate=false", "--profile", "dev", "--cpus", "2", "--memory", "2", "--disk", "100",
+                "--vm-type", "vz", "--mount-type", "virtiofs", "--vz-rosetta=true", "--kubernetes=false",
+            ]
+        );
+        let qemu = ResourceChange::new_vm(Resources::DEFAULT, VM_KINDS[3], true, true);
+        assert_eq!(start_args("dev", qemu)[10..], ["--vm-type", "qemu", "--mount-type", "9p", "--kubernetes=true"]);
+    }
+
+    #[test]
+    fn only_switches_that_changed_reach_colima() {
+        let vz = VmSettings { vm_type: "vz".into(), rosetta: true, ..Default::default() };
+        let same = ResourceChange::default().with_switches(Some(&vz), true, false);
+        assert!(same.is_empty());
+        let both = ResourceChange::default().with_switches(Some(&vz), false, true);
+        assert_eq!(start_args("default", both)[4..], ["--vz-rosetta=false", "--kubernetes=true"]);
+        let qemu = VmSettings { vm_type: "qemu".into(), ..Default::default() };
+        assert_eq!(ResourceChange::default().with_switches(Some(&qemu), true, false).rosetta, None);
+        assert!(ResourceChange::default().with_switches(None, false, false).is_empty());
+    }
+
+    #[test]
+    fn settings_come_from_colima_yaml() {
+        let text = "cpu: 2\nkubernetes:\n  enabled: true # k3s\n  version: v1.35.0+k3s1\n  k3sArgs:\n    - --disable=traefik\n\
+                    network:\n  enabled: false\nvmType: \"vz\"\nrosetta: true\nmountType: virtiofs\n";
+        let expected = VmSettings { vm_type: "vz".into(), mount_type: "virtiofs".into(), rosetta: true, kubernetes: true };
+        assert_eq!(parse_settings(text), expected);
+        let off = parse_settings("kubernetes:\n  enabled: false\nnetwork:\n  enabled: true\nvmType: qemu\n");
+        assert_eq!(off, VmSettings { vm_type: "qemu".into(), ..Default::default() });
+    }
+
+    #[test]
+    fn each_profile_has_its_own_lima_instance() {
+        assert_eq!(lima_instance("default"), "colima");
+        assert_eq!(lima_instance("dev"), "colima-dev");
+        assert_eq!(lima_instance("colima-dev"), "colima-dev");
+    }
+
+    #[test]
+    fn profile_names_lima_and_colima_accept() {
+        let existing = ["default".to_string(), "work".to_string()];
+        for good in ["dev", "dev-2", "a_b", "X1"] {
+            assert_eq!(profile_name_problem(good, &existing), None, "{good}");
+        }
+        let long = "a".repeat(31);
+        for bad in ["", "-x", "x-", "a--b", "a b", "a.b", "ü", "default", "Work", "colima", "colima-x", &long] {
+            assert!(profile_name_problem(bad, &existing).is_some(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_profile_menu_starts_with_default() {
+        let listed = ["work".to_string(), "default".to_string(), "dev".to_string()];
+        assert_eq!(profile_choices(&listed, "new"), ["default", "dev", "new", "work"]);
+        assert_eq!(profile_choices(&[], "default"), ["default"]);
     }
 
     #[test]
@@ -396,7 +638,7 @@ mod tests {
     #[test]
     fn a_first_start_sends_every_value() {
         let wanted = Resources { cpus: 4, memory: 8, disk: 60 };
-        let expected = ResourceChange { cpus: Some(4), memory: Some(8), disk: Some(60) };
+        let expected = ResourceChange { cpus: Some(4), memory: Some(8), disk: Some(60), ..Default::default() };
         assert_eq!(ResourceChange::between(None, wanted), expected);
     }
 
@@ -468,10 +710,10 @@ mod tests {
     #[test]
     fn profile_listing_is_one_json_object_per_line() {
         let text = "{\"name\":\"other\",\"status\":\"Stopped\"}\n{\"name\":\"default\",\"status\":\"Running\",\"cpus\":2}\n";
-        let profile = parse_profile(text, "default").unwrap();
-        assert_eq!(profile.status, "Running");
-        assert_eq!(profile.cpus, 2);
-        assert!(parse_profile(text, "missing").is_none());
+        let profiles = parse_profiles(text);
+        assert_eq!(profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["other", "default"]);
+        assert_eq!(profiles[1].status, "Running");
+        assert_eq!(profiles[1].cpus, 2);
     }
 
     #[test]

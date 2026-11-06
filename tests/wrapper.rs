@@ -19,6 +19,17 @@ printf '[%s]' "$@"
 exit 3
 "#;
 
+/// Stands in for `defaults`, so no test reads the real app's settings. With
+/// nothing set it fails the way the real one does.
+const FAKE_DEFAULTS: &str = r#"#!/bin/sh
+if [ "$*" = "read local.dockerplus.app DPColimaProfile" ] && [ -n "$FAKE_APP_PROFILE" ]; then
+    echo "$FAKE_APP_PROFILE"
+    exit 0
+fi
+echo "The domain/default pair of (local.dockerplus.app, DPColimaProfile) does not exist" >&2
+exit 1
+"#;
+
 struct Sandbox {
     home: PathBuf,
     _socket: Option<UnixListener>,
@@ -36,6 +47,7 @@ impl Sandbox {
         let socket = colima_running.then(|| UnixListener::bind(home.join(".colima/default/docker.sock")).unwrap());
         let sandbox = Self { home, _socket: socket };
         sandbox.add_tool("docker", FAKE_DOCKER);
+        sandbox.add_tool("defaults", FAKE_DEFAULTS);
         sandbox
     }
 
@@ -64,6 +76,17 @@ impl Sandbox {
 
     fn socket_url(&self) -> String {
         format!("unix://{}/.colima/default/docker.sock", self.home.display())
+    }
+
+    /// Makes `profile` look running for as long as the listener lives.
+    fn serve(&self, profile: &str) -> UnixListener {
+        let dir = self.home.join(".colima").join(profile);
+        fs::create_dir_all(&dir).unwrap();
+        UnixListener::bind(dir.join("docker.sock")).unwrap()
+    }
+
+    fn profile_socket_url(&self, profile: &str) -> String {
+        format!("unix://{}/.colima/{profile}/docker.sock", self.home.display())
     }
 }
 
@@ -210,4 +233,50 @@ fn colima_home_moves_the_socket() {
     let moved_text = moved.to_string_lossy().into_owned();
     let output = sandbox.run_in(&sandbox.home, &["ps"], &[("COLIMA_HOME", moved_text.as_str())]);
     assert!(stdout(&output).contains(&format!("host=unix://{moved_text}/default/docker.sock")));
+}
+
+#[test]
+fn the_profile_picked_in_the_app_is_used() {
+    let sandbox = Sandbox::new(true);
+    let _work = sandbox.serve("work");
+    let output = sandbox.run_in(&sandbox.home, &["ps"], &[("FAKE_APP_PROFILE", "work")]);
+    assert!(stdout(&output).contains(&format!("host={} ", sandbox.profile_socket_url("work"))));
+    assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn colima_profile_beats_the_app() {
+    let sandbox = Sandbox::new(true);
+    let _dev = sandbox.serve("dev");
+    let env = [("COLIMA_PROFILE", "dev"), ("FAKE_APP_PROFILE", "work")];
+    let output = sandbox.run_in(&sandbox.home, &["ps"], &env);
+    assert!(stdout(&output).contains(&format!("host={} ", sandbox.profile_socket_url("dev"))));
+}
+
+#[test]
+fn profile_names_mean_what_they_mean_to_colima() {
+    let sandbox = Sandbox::new(true);
+    let _dev = sandbox.serve("dev");
+    let prefixed = sandbox.run_in(&sandbox.home, &["ps"], &[("COLIMA_PROFILE", "colima-dev")]);
+    assert!(stdout(&prefixed).contains(&format!("host={} ", sandbox.profile_socket_url("dev"))));
+    let plain = sandbox.run_in(&sandbox.home, &["ps"], &[("COLIMA_PROFILE", "colima")]);
+    assert!(stdout(&plain).contains(&format!("host={} ", sandbox.socket_url())));
+}
+
+#[test]
+fn an_odd_setting_from_the_app_is_ignored() {
+    let sandbox = Sandbox::new(true);
+    for odd in ["../x", "a b", "-x", "a/b"] {
+        let output = sandbox.run_in(&sandbox.home, &["ps"], &[("FAKE_APP_PROFILE", odd)]);
+        assert!(stdout(&output).contains(&format!("host={} ", sandbox.socket_url())), "{odd}");
+        assert_eq!(stderr(&output), "", "{odd}");
+    }
+}
+
+#[test]
+fn a_stopped_profile_is_named_in_the_hint() {
+    let sandbox = Sandbox::new(true);
+    let output = sandbox.run_in(&sandbox.home, &["--version"], &[("FAKE_APP_PROFILE", "work")]);
+    assert!(stderr(&output).contains("Colima profile work is not running"));
+    assert!(reached_docker(&output));
 }

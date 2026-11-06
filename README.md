@@ -23,13 +23,15 @@
 
 - **Containers:** start, stop, restart, pause, remove. Right-click to open a shell, a port or a mount.
 - **Compose:** projects group in the list, fold shut, and start, stop, restart or remove as one.
+  Compose Up starts one from a folder or a Compose file.
 - **Logs:** live, with search. Stays responsive when a container floods them.
 - **CPU and memory:** only when you ask, and never in the background.
-- **Images, volumes, storage:** pull images, see sizes and what uses what, and remove what
-  nothing needs.
-- **Colima:** start, stop, restart, and change CPUs, memory and disk.
+- **Images, volumes, networks, storage:** pull images, see sizes and what uses what, and remove
+  what nothing needs.
+- **Colima:** start, stop, restart. VM Settings changes CPUs, memory, disk, Rosetta and
+  Kubernetes. Each profile is its own VM; its VM type and mount are picked when you create it.
 
-`⌘1`–`⌘5` pages · `⌘F` filter · `⌘L` logs · `⇧⌘F` find in logs · `⌘I` details · `⇧⌘M` CPU and memory · `⌘R` refresh
+`⌘1`–`⌘6` pages · `⌘O` Compose Up · `⌘F` filter · `⌘L` logs · `⇧⌘F` find in logs · `⌘I` details · `⇧⌘M` CPU and memory · `⌘R` refresh
 
 ## Install
 
@@ -43,7 +45,9 @@ scripts/install.sh
 
 This installs what is missing, builds the app from source into `/Applications` and adds the
 `dockerplus` command. A full build takes about 30 seconds on an M1 Pro once Rust is in place.
-Run it again to update.
+
+To update, choose **Check for Updates…** in the DockerPlus menu. It checks only when you ask
+and updates only by fast-forward. Running `git pull` and the script again does the same.
 
 There is no signed download yet. The app is ad-hoc signed, so it is meant for the Mac that
 built it. The first Colima start downloads and sets up its VM, so it takes longer than later
@@ -56,11 +60,12 @@ Plain `docker` keeps working as before.
 
 ## Command line
 
-`dockerplus` is the Docker CLI pointed at Colima.
+`dockerplus` is the Docker CLI pointed at Colima, on the profile picked in the app.
 
 ```bash
-dockerplus compose up -d    # runs on Colima
-docker compose up -d        # runs on your current context
+dockerplus compose up -d            # runs on Colima
+COLIMA_PROFILE=dev dockerplus ps    # another profile
+docker compose up -d                # runs on your current context
 ```
 
 The two engines stay separate:
@@ -92,8 +97,7 @@ scripts/bundle.sh --features devtools   # adds a socket that drives the UI in te
 Brand guide: [assets/brand/rex/BRAND.md](assets/brand/rex/BRAND.md).
 
 Version 0.1, tested on an M1 Pro MacBook Pro with macOS 27.2, Colima 0.10.3 and Docker Engine
-29.5.2, where the memory and idle CPU above were measured. Not yet supported: Colima profiles
-other than `default`, Compose up, networks, notarization.
+29.5.2, where the memory and idle CPU above were measured. Not yet supported: notarization.
 
 ## License
 

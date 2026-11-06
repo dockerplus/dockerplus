@@ -14,4 +14,5 @@ pub mod pages;
 pub mod sidebar;
 pub mod table;
 pub mod toolbar;
+pub mod updates;
 pub mod util;

@@ -10,8 +10,13 @@ use super::sidebar::{Sidebar, StatusView};
 use super::table::{Table, filter_rows};
 use super::toolbar::Toolbar;
 use super::util::*;
-use crate::backend::colima::{Colima, ColimaInfo, ResourceChange, Resources, disk_on_mac, find_tool};
-use crate::backend::docker::{ContainerAction, DResult, Docker, Scope, Snapshot, compose, exec_script};
+use crate::backend::colima::{
+    Colima, ColimaInfo, DEFAULT_PROFILE, ResourceChange, Resources, VM_KINDS, disk_on_mac, find_tool, profile_choices,
+    profile_name_problem,
+};
+use crate::backend::docker::{
+    ContainerAction, DResult, Docker, Scope, Snapshot, compose, compose_up, compose_up_args, exec_script, shared_with_vm,
+};
 use crate::backend::http::Cancel;
 use crate::backend::model::*;
 use block2::RcBlock;
@@ -27,13 +32,15 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const PROFILE: &str = "default";
+/// The profile in use, kept across launches.
+const PROFILE_KEY: &str = "DPColimaProfile";
 const LOG_TAIL: u32 = 1000;
 const LOG_PANEL_HEIGHT: f64 = 250.0;
 /// Text reaching AppKit is capped at one buffer per flush, about 5 MB/s. That is
@@ -65,14 +72,23 @@ const STATS_REST_RATIO: u32 = 20;
 const SAMPLER_WAKE: Duration = Duration::from_millis(250);
 /// How often to re-ask Colima while it says "running" but Docker is silent.
 const COLIMA_RECHECK: Duration = Duration::from_secs(3);
+/// The pause before reopening an event stream that ended, doubling while they
+/// keep ending at once, up to the ceiling.
+const EVENTS_RETRY: Duration = Duration::from_millis(300);
+const EVENTS_RETRY_MAX: Duration = Duration::from_secs(30);
+/// A stream that ran this long was healthy, so its end starts the pauses over.
+const EVENTS_HEALTHY: Duration = Duration::from_secs(10);
 
 pub enum Msg {
-    Colima(Box<ColimaInfo>),
-    Engine(bool),
+    /// Tagged with its profile, so a late reply cannot land on another one.
+    Colima(String, Box<ColimaInfo>),
+    /// The watcher's generation, and whether the engine answered.
+    Engine(u64, bool),
     Changed(Scope),
-    Snapshot(Snapshot),
-    Version(Option<EngineVersion>),
-    VolumeSizes(HashMap<String, i64>),
+    // Engine replies carry the epoch they were asked in, see `State::epoch`.
+    Snapshot(u64, Snapshot),
+    Version(u64, Option<EngineVersion>),
+    VolumeSizes(u64, HashMap<String, i64>),
     CliLine(String),
     CliDone(Result<(), String>),
     ActionDone(Option<String>),
@@ -80,10 +96,11 @@ pub enum Msg {
     PullDone(Result<(), String>),
     LogEnded(u64, Option<String>),
     Details(DResult<Box<ContainerDetails>>),
-    Storage(DResult<Vec<StorageLine>>, Option<u64>),
+    Storage(u64, DResult<Vec<StorageLine>>, Option<u64>),
     Pruned(DResult<i64>),
     Stats(StatsReading),
     VmMemory(u64, u64),
+    PrunePreview(u64, Prune, DResult<PrunePreview>),
 }
 
 thread_local! {
@@ -167,6 +184,10 @@ struct LogSession {
 pub struct State {
     pub page: Page,
     navigated: bool,
+    /// The Colima profile everything on screen belongs to.
+    pub profile: String,
+    /// Whether the saved profile has been checked against `colima list`.
+    profile_checked: bool,
     pub info: Option<ColimaInfo>,
     pub engine_up: bool,
     engine: Option<EngineVersion>,
@@ -174,6 +195,7 @@ pub struct State {
     pub containers: Vec<Container>,
     pub images: Vec<Image>,
     pub volumes: Vec<Volume>,
+    pub networks: Vec<Network>,
     sizes: HashMap<String, i64>,
     filter: String,
     refreshing: bool,
@@ -182,6 +204,13 @@ pub struct State {
     refresh_scheduled: bool,
     /// The last refresh failed, so a list on screen may be out of date.
     retrying: bool,
+    /// Counts the engine coming and going. A reply asked for in an earlier epoch
+    /// describes an engine that has since gone or been swapped, and is dropped.
+    epoch: u64,
+    /// `/system/df` walks the disk: one at a time, and at most one more queued.
+    storage_loading: bool,
+    storage_again: bool,
+    storage_error: Option<String>,
     recheck_scheduled: bool,
     busy_actions: usize,
     pull: Option<String>,
@@ -207,6 +236,7 @@ pub struct Controller {
     pub containers: Table,
     pub images: Table,
     pub volumes: Table,
+    pub networks: Table,
     pub storage: Table,
     pub colima_page: ColimaPage,
     pub logs: LogPanel,
@@ -246,6 +276,12 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
     ]);
     let images = table(pages::IMAGE_COLUMNS, &[Some(("Copy ID", Action::CopyId)), None, Some(("Remove…", Action::Remove))]);
     let volumes = table(pages::VOLUME_COLUMNS, &[Some(("Copy Name", Action::CopyId)), None, Some(("Remove…", Action::Remove))]);
+    let networks = table(pages::NETWORK_COLUMNS, &[
+        Some(("Copy ID", Action::CopyId)),
+        None,
+        Some(("Remove…", Action::Remove)),
+        Some(("Remove Unused…", Action::Prune)),
+    ]);
     let storage = table(pages::STORAGE_COLUMNS, &[Some(("Remove Unused…", Action::Prune))]);
 
     let colima_page = ColimaPage::new(mtm, &actions);
@@ -254,7 +290,7 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
     let logs = LogPanel::new(mtm, &actions);
 
     let pages_view = NSView::new(mtm);
-    for view in [&*containers.scroll as &NSView, &images.scroll, &volumes.scroll, &storage.scroll, &colima_page.view] {
+    for view in [&*containers.scroll as &NSView, &images.scroll, &volumes.scroll, &networks.scroll, &storage.scroll, &colima_page.view] {
         pages_view.addSubview(view);
         pin(view, &pages_view);
     }
@@ -327,7 +363,8 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
     }
     pages_view.setAdditionalSafeAreaInsets(NSEdgeInsets { top: 0.0, left: 0.0, bottom: HUD_CLEARANCE, right: 0.0 });
 
-    let docker = Docker::new(Colima::default_socket(PROFILE));
+    let profile = saved_profile();
+    let docker = Docker::new(Colima::default_socket(&profile));
     let ctl = Rc::new(Controller {
         mtm,
         window: window.clone(),
@@ -337,6 +374,7 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
         containers,
         images,
         volumes,
+        networks,
         storage,
         colima_page,
         logs,
@@ -344,9 +382,9 @@ pub fn launch(mtm: MainThreadMarker, actions: Retained<Actions>) {
         empty,
         detail,
         _split: split,
-        colima: Colima::locate(PROFILE),
+        colima: Colima::locate(&profile),
         docker: Arc::new(Mutex::new(docker)),
-        st: RefCell::default(),
+        st: RefCell::new(State { profile, ..State::default() }),
         #[cfg(feature = "devtools")]
         page_log: RefCell::default(),
     });
@@ -361,11 +399,54 @@ impl Controller {
         self.render();
         self.reload_colima();
         spawn_watcher(self.docker.clone());
+        self.watch_for_wake();
         self.tick();
     }
 
     fn docker(&self) -> Docker {
         self.docker.lock().unwrap().clone()
+    }
+
+    /// Whether a reply asked for in `epoch` still describes the engine on screen.
+    fn current(&self, epoch: u64) -> bool {
+        self.st.borrow().epoch == epoch
+    }
+
+    /// Starts over with the engine `self.docker` now points at: what the old one
+    /// showed goes at once, and the watcher announces the new one, up or down.
+    pub fn reconnect_engine(&self) {
+        WATCH.restart();
+        if self.st.borrow().engine_up {
+            self.engine_changed(false);
+        }
+    }
+
+    /// After the Mac sleeps, the event stream may be quietly dead. Reopening it
+    /// also refetches every list, and Colima may have changed state meanwhile.
+    fn woke(&self) {
+        WATCH.interrupt();
+        self.reload_colima();
+    }
+
+    fn watch_for_wake(&self) {
+        let block = RcBlock::new(|_: NonNull<NSNotification>| {
+            with_ctl(Controller::woke);
+        });
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        // The center holds on to the observer, block included, for the app's life.
+        let _ = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSWorkspaceDidWakeNotification),
+                None,
+                Some(&NSOperationQueue::mainQueue()),
+                &block,
+            )
+        };
+    }
+
+    /// Colima for the profile on screen.
+    fn colima(&self) -> Option<Colima> {
+        self.colima.as_ref().map(|colima| colima.with_profile(&self.st.borrow().profile))
     }
 
     fn phase(&self) -> Phase {
@@ -389,7 +470,11 @@ impl Controller {
 
     pub fn handle(&self, msg: Msg) {
         match msg {
-            Msg::Colima(info) => {
+            Msg::Colima(profile, info) => {
+                let current = profile == self.st.borrow().profile;
+                if !current || self.leave_vanished_profile(&info) {
+                    return;
+                }
                 if let Some(socket) = info.status.as_ref().map(|s| s.docker_socket.as_str()) {
                     self.adopt_socket(socket);
                 }
@@ -397,16 +482,25 @@ impl Controller {
                 self.render_chrome();
                 self.recheck_if_unsettled();
             }
-            Msg::Engine(up) => self.engine_changed(up),
-            Msg::Changed(scope) => self.schedule_refresh(scope, REFRESH_DEBOUNCE),
-            Msg::Snapshot(snapshot) => self.snapshot_arrived(snapshot),
-            Msg::Version(version) => {
-                self.st.borrow_mut().engine = version;
-                self.render_chrome();
+            Msg::Engine(generation, up) => {
+                // A report on an engine since swapped for another is stale.
+                if generation == WATCH.generation() && up != self.st.borrow().engine_up {
+                    self.engine_changed(up);
+                }
             }
-            Msg::VolumeSizes(sizes) => {
-                self.st.borrow_mut().sizes = sizes;
-                self.render();
+            Msg::Changed(scope) => self.schedule_refresh(scope, REFRESH_DEBOUNCE),
+            Msg::Snapshot(epoch, snapshot) => self.snapshot_arrived(epoch, snapshot),
+            Msg::Version(epoch, version) => {
+                if self.current(epoch) {
+                    self.st.borrow_mut().engine = version;
+                    self.render_chrome();
+                }
+            }
+            Msg::VolumeSizes(epoch, sizes) => {
+                if self.current(epoch) {
+                    self.st.borrow_mut().sizes = sizes;
+                    self.render();
+                }
             }
             Msg::CliLine(line) => self.colima_page.log_line(&line),
             Msg::CliDone(result) => {
@@ -443,16 +537,7 @@ impl Controller {
             }
             Msg::LogEnded(generation, error) => self.log_ended(generation, error),
             Msg::Details(result) => self.details_arrived(result),
-            Msg::Storage(result, on_mac) => {
-                {
-                    let mut st = self.st.borrow_mut();
-                    if let Ok(lines) = result {
-                        st.storage = lines;
-                    }
-                    st.mac_disk = on_mac;
-                }
-                self.render();
-            }
+            Msg::Storage(epoch, result, on_mac) => self.storage_arrived(epoch, result, on_mac),
             Msg::Pruned(result) => {
                 {
                     let mut st = self.st.borrow_mut();
@@ -479,6 +564,7 @@ impl Controller {
                     self.render_status();
                 }
             }
+            Msg::PrunePreview(epoch, kind, result) => self.prune_preview_arrived(epoch, kind, result),
         }
     }
 
@@ -494,12 +580,13 @@ impl Controller {
     }
 
     fn reload_colima(&self) {
-        let Some(colima) = self.colima.clone() else {
+        let Some(colima) = self.colima() else {
             self.st.borrow_mut().info = Some(ColimaInfo::default());
             self.render_chrome();
             return;
         };
-        thread::spawn(move || post(Msg::Colima(Box::new(colima.info()))));
+        let profile = colima.profile().to_string();
+        thread::spawn(move || post(Msg::Colima(profile, Box::new(colima.info()))));
     }
 
     /// Nothing announces a VM going down when its socket has already gone, and
@@ -526,21 +613,26 @@ impl Controller {
         {
             let mut st = self.st.borrow_mut();
             st.engine_up = up;
+            st.epoch += 1;
             if !up {
                 st.containers.clear();
                 st.images.clear();
                 st.volumes.clear();
+                st.networks.clear();
                 st.sizes.clear();
                 st.storage.clear();
                 st.engine = None;
                 st.vm_memory = None;
                 st.retrying = false;
+                st.storage_error = None;
+                st.storage_again = false;
             }
         }
         if up {
             self.refresh(Scope::ALL);
             let docker = self.docker();
-            thread::spawn(move || post(Msg::Version(docker.version().ok())));
+            let epoch = self.st.borrow().epoch;
+            thread::spawn(move || post(Msg::Version(epoch, docker.version().ok())));
             // Open on Containers if Colima was already up at launch, but leave
             // someone watching the output of their own start where they are.
             let open_containers = {
@@ -562,17 +654,17 @@ impl Controller {
 
     /// One refresh at a time; lists asked for meanwhile wait for the next one.
     fn refresh(&self, scope: Scope) {
-        let scope = {
+        let (scope, epoch) = {
             let mut st = self.st.borrow_mut();
             st.stale.merge(scope);
             if !st.engine_up || st.refreshing || st.stale.is_empty() {
                 return;
             }
             st.refreshing = true;
-            std::mem::take(&mut st.stale)
+            (std::mem::take(&mut st.stale), st.epoch)
         };
         let docker = self.docker();
-        thread::spawn(move || post(Msg::Snapshot(docker.snapshot(scope))));
+        thread::spawn(move || post(Msg::Snapshot(epoch, docker.snapshot(scope))));
     }
 
     fn schedule_refresh(&self, scope: Scope, delay: Duration) {
@@ -592,7 +684,14 @@ impl Controller {
         });
     }
 
-    fn snapshot_arrived(&self, snapshot: Snapshot) {
+    fn snapshot_arrived(&self, epoch: u64, snapshot: Snapshot) {
+        if !self.current(epoch) {
+            // About an engine that has since gone or been swapped. What was asked
+            // for meanwhile still has to be fetched.
+            self.st.borrow_mut().refreshing = false;
+            self.refresh(Scope::default());
+            return;
+        }
         let failed = snapshot.failed;
         let volumes_changed = {
             let mut st = self.st.borrow_mut();
@@ -604,6 +703,9 @@ impl Controller {
             }
             if let Some(images) = snapshot.images {
                 st.images = images;
+            }
+            if let Some(networks) = snapshot.networks {
+                st.networks = networks;
             }
             let mut volumes_changed = false;
             if let Some(volumes) = snapshot.volumes {
@@ -625,13 +727,46 @@ impl Controller {
         self.update_stats_targets();
     }
 
-    /// Walks the disk, so it only runs for the page that shows it.
+    /// Walks the disk, so it only runs for the page that shows it, one walk at a
+    /// time; whatever asks meanwhile gets one more walk after it.
     fn load_storage(&self) {
-        if self.st.borrow().page != Page::Storage || !self.st.borrow().engine_up {
-            return;
-        }
+        let epoch = {
+            let mut st = self.st.borrow_mut();
+            if st.page != Page::Storage || !st.engine_up {
+                return;
+            }
+            if st.storage_loading {
+                st.storage_again = true;
+                return;
+            }
+            st.storage_loading = true;
+            st.epoch
+        };
         let docker = self.docker();
-        thread::spawn(move || post(Msg::Storage(docker.disk_usage(), disk_on_mac())));
+        let profile = self.st.borrow().profile.clone();
+        thread::spawn(move || post(Msg::Storage(epoch, docker.disk_usage(), disk_on_mac(&profile))));
+    }
+
+    fn storage_arrived(&self, epoch: u64, result: DResult<Vec<StorageLine>>, on_mac: Option<u64>) {
+        let again = {
+            let mut st = self.st.borrow_mut();
+            st.storage_loading = false;
+            if st.epoch == epoch {
+                match result {
+                    Ok(lines) => {
+                        st.storage = lines;
+                        st.storage_error = None;
+                    }
+                    Err(error) => st.storage_error = Some(error),
+                }
+                st.mac_disk = on_mac;
+            }
+            std::mem::take(&mut st.storage_again)
+        };
+        self.render();
+        if again {
+            self.load_storage();
+        }
     }
 
     fn load_volume_sizes(&self) {
@@ -639,9 +774,10 @@ impl Controller {
             return;
         }
         let docker = self.docker();
+        let epoch = self.st.borrow().epoch;
         thread::spawn(move || {
             if let Ok(sizes) = docker.volume_sizes() {
-                post(Msg::VolumeSizes(sizes));
+                post(Msg::VolumeSizes(epoch, sizes));
             }
         });
     }
@@ -692,6 +828,9 @@ impl Controller {
                     Some(&self.volumes),
                     filter_rows(pages::volume_rows(&st.volumes, &st.containers, &st.sizes, now), query),
                 ),
+                Page::Networks => {
+                    (Some(&self.networks), filter_rows(pages::network_rows(&st.networks, &st.containers, now), query))
+                }
             }
         };
         if let Some(table) = table {
@@ -703,6 +842,7 @@ impl Controller {
         self.sidebar.set_count(Page::Containers, up.then_some(st.containers.len()));
         self.sidebar.set_count(Page::Images, up.then_some(st.images.len()));
         self.sidebar.set_count(Page::Volumes, up.then_some(st.volumes.len()));
+        self.sidebar.set_count(Page::Networks, up.then_some(st.networks.len()));
     }
 
     fn render_status(&self) {
@@ -733,13 +873,14 @@ impl Controller {
         let headline = match phase {
             Phase::NotInstalled => "Colima is not installed. Run: brew install colima".to_string(),
             Phase::Stopped if !info.provisioned => "No virtual machine yet. The first start downloads one.".to_string(),
-            _ => format!("Profile “{PROFILE}”{}", if version.is_empty() { String::new() } else { format!(" · {version}") }),
+            _ => version,
         };
         let memory_in_use = st.vm_memory.map(|(used, total)| pages::vm_memory_text(used, total));
         self.colima_page.update(&info, st.engine.as_ref(), memory_in_use, &headline, title);
 
         let idle = st.op.is_none();
         let installed = self.colima.is_some();
+        self.colima_page.set_profiles(&profile_choices(&info.profiles, &st.profile), &st.profile, installed && idle);
         let up = matches!(phase, Phase::Running | Phase::NoEngine);
         self.colima_page.start.setEnabled(installed && idle && !up);
         self.colima_page.stop.setEnabled(installed && idle && up);
@@ -765,6 +906,7 @@ impl Controller {
         self.containers.scroll.setHidden(page != Page::Containers || !up);
         self.images.scroll.setHidden(page != Page::Images || !up);
         self.volumes.scroll.setHidden(page != Page::Volumes || !up);
+        self.networks.scroll.setHidden(page != Page::Networks || !up);
         self.storage.scroll.setHidden(page != Page::Storage || !up);
         self.empty.view.setHidden(page == Page::Colima || up);
         self.hud.view.setHidden(page == Page::Colima || !up);
@@ -774,6 +916,7 @@ impl Controller {
             Page::Containers => pages::containers_summary(&st.containers),
             Page::Images => pages::images_summary(&st.images),
             Page::Volumes => pages::volumes_summary(&st.volumes),
+            Page::Networks => pages::networks_summary(&st.networks),
             Page::Storage => pages::storage_summary(&st.storage, st.mac_disk),
         };
         self.window.setTitle(&ns(page.title()));
@@ -784,6 +927,10 @@ impl Controller {
             (st.busy_actions > 0).then(|| "Working…".to_string())
         });
         let activity = activity.or_else(|| st.retrying.then(|| "Could not refresh, retrying…".to_string()));
+        let activity = activity.or_else(|| {
+            let error = st.storage_error.as_ref().filter(|_| page == Page::Storage)?;
+            Some(format!("Could not read storage: {error}"))
+        });
         self.hud.set_activity(activity.as_deref());
     }
 
@@ -798,6 +945,7 @@ impl Controller {
             Action::ContainerStop,
             Action::ContainerRestart,
             Action::ShowLogs,
+            Action::ComposeUp,
             Action::Pull,
             Action::Remove,
             Action::RunningOnly,
@@ -810,16 +958,17 @@ impl Controller {
                 | Action::ContainerStop
                 | Action::ContainerRestart
                 | Action::ShowLogs
+                | Action::ComposeUp
                 | Action::RunningOnly
                 | Action::ToggleStats => containers,
                 Action::Pull => page == Page::Images,
-                Action::Prune => page == Page::Storage,
-                Action::Remove => matches!(page, Page::Containers | Page::Images | Page::Volumes),
+                Action::Prune => matches!(page, Page::Storage | Page::Networks),
+                Action::Remove => matches!(page, Page::Containers | Page::Images | Page::Volumes | Page::Networks),
                 _ => true,
             };
             self.toolbar.set(action, visible && up, self.can(action));
         }
-        self.toolbar.set_search_visible(matches!(page, Page::Containers | Page::Images | Page::Volumes) && up);
+        self.toolbar.set_search_visible(matches!(page, Page::Containers | Page::Images | Page::Volumes | Page::Networks) && up);
     }
 
     /// Whether an action applies right now. Drives both toolbar and menus.
@@ -835,11 +984,13 @@ impl Controller {
             Action::ContainerStop => selected.iter().any(|c| c.is_running()),
             Action::ContainerRestart => !selected.is_empty(),
             Action::ShowLogs => selected.len() == 1 && self.selected_projects().is_empty(),
+            Action::Prune if st.page == Page::Networks => !pages::unused_networks(&st.networks, &st.containers).is_empty(),
             Action::Prune => self.selected_storage_line().is_some_and(|l| l.reclaimable > 0 || l.items > l.active),
             Action::ToggleStats => st.engine_up,
             Action::LogsFind => !self.logs.view.isHidden(),
             // Not while half-started: the sizes Colima reports then are unreliable.
             Action::ColimaResources => self.colima.is_some() && matches!(phase, Phase::Stopped | Phase::Running),
+            Action::ColimaProfile | Action::ColimaNewProfile => self.colima.is_some() && st.op.is_none(),
             Action::ContainerPause => selected.iter().any(|c| c.state == "running"),
             Action::ContainerResume => selected.iter().any(|c| c.state == "paused"),
             Action::ShowDetails => st.page == Page::Containers && selected.len() == 1,
@@ -848,7 +999,9 @@ impl Controller {
             Action::RevealMount => matches!(selected.as_slice(), [c] if !host_mounts(c).is_empty()),
             Action::SelectProject => selected.iter().any(|c| !c.project().is_empty()),
             Action::RunningOnly => st.engine_up,
-            Action::Pull | Action::Refresh => st.engine_up,
+            Action::CheckUpdates => !super::updates::checking(),
+            Action::Pull | Action::Refresh | Action::ComposeUp => st.engine_up,
+            Action::Remove if st.page == Page::Networks => !self.removable_networks().is_empty(),
             Action::Remove | Action::CopyId => match st.page {
                 Page::Colima | Page::Storage => false,
                 Page::Containers => !selected.is_empty(),
@@ -864,6 +1017,7 @@ impl Controller {
             Page::Containers => Some(&self.containers),
             Page::Images => Some(&self.images),
             Page::Volumes => Some(&self.volumes),
+            Page::Networks => Some(&self.networks),
         }
     }
 
@@ -896,6 +1050,13 @@ impl Controller {
         let keys = self.storage.selected_keys();
         let [key] = keys.as_slice() else { return None };
         self.st.borrow().storage.iter().find(|line| line.kind.title() == key).copied()
+    }
+
+    /// The selected networks, less the engine's own.
+    fn removable_networks(&self) -> Vec<String> {
+        let st = self.st.borrow();
+        let keys = self.networks.selected_keys();
+        st.networks.iter().filter(|n| !n.is_builtin() && keys.contains(&n.id)).map(|n| n.id.clone()).collect()
     }
 
     // User input
@@ -987,8 +1148,10 @@ impl Controller {
             Action::ShowContainers => self.sidebar.select(Page::Containers),
             Action::ShowImages => self.sidebar.select(Page::Images),
             Action::ShowVolumes => self.sidebar.select(Page::Volumes),
+            Action::ShowNetworks => self.sidebar.select(Page::Networks),
             Action::ShowStorage => self.sidebar.select(Page::Storage),
             Action::Prune => self.ask_prune(),
+            Action::ComposeUp => self.ask_compose_up(),
             Action::LogsFind => {
                 if !self.logs.view.isHidden() {
                     self.logs.show_find(&self.window, self.mtm);
@@ -999,10 +1162,20 @@ impl Controller {
             Action::LogsClear => self.logs.clear(),
             Action::LogsClose => self.close_logs(),
             Action::ColimaResources => self.ask_resources(),
+            Action::ColimaProfile => match self.colima_page.picked_profile() {
+                Some(name) => self.select_profile(&name),
+                None => {
+                    // "New Profile…" is not a profile: show the current one again.
+                    self.render_status();
+                    self.ask_new_profile(NewProfile::default());
+                }
+            },
+            Action::ColimaNewProfile => self.ask_new_profile(NewProfile::default()),
             Action::ContainerPause => self.container_action(ContainerAction::Pause),
             Action::ContainerResume => self.container_action(ContainerAction::Unpause),
             Action::ShowDetails => self.show_details(),
             Action::OpenTerminal => self.open_terminal(),
+            Action::CheckUpdates => super::updates::check(),
             Action::SelectProject => self.select_project(),
             Action::RunningOnly => {
                 let on = !self.st.borrow().running_only;
@@ -1024,7 +1197,7 @@ impl Controller {
     }
 
     fn colima_op(&self, op: ColimaOp) {
-        let Some(colima) = self.colima.clone() else { return };
+        let Some(colima) = self.colima() else { return };
         {
             let mut st = self.st.borrow_mut();
             if st.op.is_some() {
@@ -1053,14 +1226,15 @@ impl Controller {
         });
     }
 
-    /// Asks for a new VM size. Colima only applies it on start, so an up VM is
-    /// restarted, with the same warning as a plain restart.
+    /// Asks for a new VM size and switches. Colima only applies them on start,
+    /// so an up VM is restarted, with the same warning as a plain restart.
     fn ask_resources(&self) {
         let up = self.phase() == Phase::Running;
-        let (current, running) = {
+        let (current, settings, running) = {
             let st = self.st.borrow();
             let current = st.info.as_ref().and_then(Resources::current);
-            (current, st.containers.iter().filter(|c| c.is_running()).count())
+            let settings = st.info.as_ref().and_then(|info| info.settings.clone()).unwrap_or_default();
+            (current, settings, st.containers.iter().filter(|c| c.is_running()).count())
         };
         let chosen = current.unwrap_or(Resources::DEFAULT);
         let host = NSProcessInfo::processInfo();
@@ -1079,16 +1253,35 @@ impl Controller {
             let row: [&NSView; 2] = [&key, popup];
             grid.addRowWithViews(&NSArray::from_slice(&row));
         }
+        let add_row = |title: &str, view: &NSView| {
+            let key = label(self.mtm, title, 13.0, unsafe { NSFontWeightRegular });
+            let row: [&NSView; 2] = [&key, view];
+            grid.addRowWithViews(&NSArray::from_slice(&row));
+        };
+        let value = |text: &str| label(self.mtm, if text.is_empty() { "—" } else { text }, 13.0, unsafe { NSFontWeightRegular });
+        let vz = matches!(settings.vm_type.as_str(), "vz" | "");
+        let rosetta = checkbox(self.mtm, if vz { "Rosetta for x86 images" } else { "Rosetta (VZ only)" }, settings.rosetta);
+        rosetta.setEnabled(vz);
+        let kubernetes = checkbox(self.mtm, "Kubernetes", settings.kubernetes);
+        add_row("VM type", &value(&settings.vm_type));
+        add_row("Mount", &value(&settings.mount_type));
+        add_row("", &secondary_label(self.mtm, "To use a different VM type or mount, create a new profile.", 11.0));
+        // Rosetta needs Apple silicon, where this build then runs natively.
+        if cfg!(target_arch = "aarch64") {
+            add_row("", &rosetta);
+        }
+        add_row("", &kubernetes);
+        add_row("", &secondary_label(self.mtm, "Kubernetes runs in the VM and takes more of its CPU and memory.", 11.0));
         grid.columnAtIndex(0).setXPlacement(NSGridCellPlacement::Trailing);
         grid.setFrameSize(grid.fittingSize());
 
         let detail = if up {
-            format!("Colima restarts to apply this. {} Disk size can only grow.", running_note(running))
+            format!("Colima restarts to apply changes. {} Disk size can only grow.", running_note(running))
         } else {
             "Colima starts with these settings. Disk size can only grow.".to_string()
         };
         let alert = NSAlert::new(self.mtm);
-        alert.setMessageText(&ns("Colima resources"));
+        alert.setMessageText(&ns(&format!("Settings for “{}”", self.st.borrow().profile)));
         alert.setInformativeText(&ns(&detail));
         alert.addButtonWithTitle(&ns(if up { "Restart" } else { "Start" }));
         alert.addButtonWithTitle(&ns("Cancel"));
@@ -1098,7 +1291,8 @@ impl Controller {
             let picked = (pick(&cpus, &cpu_values), pick(&memory, &memory_values), pick(&disk, &disk_values));
             let (Some(c), Some(m), Some(d)) = picked else { return };
             if response == NSAlertFirstButtonReturn {
-                with_ctl(|ctl| ctl.apply_resources(Resources { cpus: c, memory: m, disk: d }));
+                let switches = (is_on(&rosetta), is_on(&kubernetes));
+                with_ctl(|ctl| ctl.apply_resources(Resources { cpus: c, memory: m, disk: d }, switches));
             }
         });
         alert.beginSheetModalForWindow_completionHandler(&self.window, Some(&block));
@@ -1107,13 +1301,159 @@ impl Controller {
     /// Judged now, not when the sheet opened: Colima may have been started or
     /// stopped from a terminal in between, and a start on a running VM would
     /// quietly ignore the new size.
-    fn apply_resources(&self, wanted: Resources) {
+    fn apply_resources(&self, wanted: Resources, (rosetta, kubernetes): (bool, bool)) {
         let up = matches!(self.phase(), Phase::Running | Phase::NoEngine);
-        let current = self.st.borrow().info.as_ref().and_then(Resources::current);
-        let change = ResourceChange::between(current, wanted);
+        let (current, settings) = {
+            let st = self.st.borrow();
+            let info = st.info.as_ref();
+            (info.and_then(Resources::current), info.and_then(|info| info.settings.clone()))
+        };
+        let change = ResourceChange::between(current, wanted).with_switches(settings.as_ref(), rosetta, kubernetes);
         if !(up && change.is_empty()) {
             self.colima_op(ColimaOp::Resize { change, restart: up });
         }
+    }
+
+    /// Points the app at another profile: its VM, its engine and its disk.
+    pub fn select_profile(&self, name: &str) {
+        {
+            let mut st = self.st.borrow_mut();
+            if st.profile == name || st.op.is_some() {
+                return;
+            }
+            st.profile = name.to_string();
+            st.info = None;
+            st.vm_memory = None;
+            // It holds the old profile's Colima; sync_sampler starts a new one.
+            if let Some(sampler) = st.sampler.take() {
+                sampler.stop.store(true, Ordering::Relaxed);
+            }
+        }
+        unsafe { NSUserDefaults::standardUserDefaults().setObject_forKey(Some(&ns(name)), &ns(PROFILE_KEY)) };
+        *self.docker.lock().unwrap() = Docker::new(Colima::default_socket(name));
+        self.close_logs();
+        clear_text(&self.colima_page.console);
+        self.reconnect_engine();
+        self.reload_colima();
+        self.sync_sampler();
+        self.render();
+    }
+
+    /// At launch, a saved profile whose VM has since been deleted gives way to
+    /// the default one. An empty list may only mean `colima list` failed, so
+    /// it moves nothing.
+    fn leave_vanished_profile(&self, info: &ColimaInfo) -> bool {
+        let gone = {
+            let mut st = self.st.borrow_mut();
+            let first = !std::mem::replace(&mut st.profile_checked, true);
+            first && st.profile != DEFAULT_PROFILE && !info.profiles.is_empty() && !info.profiles.contains(&st.profile)
+        };
+        if gone {
+            self.select_profile(DEFAULT_PROFILE);
+        }
+        gone
+    }
+
+    /// Asks for a new profile. Its VM type and mount are fixed once Colima
+    /// creates the VM, so this is the one place to choose them.
+    fn ask_new_profile(&self, draft: NewProfile) {
+        if self.colima.is_none() || self.st.borrow().op.is_some() {
+            return;
+        }
+        let host = NSProcessInfo::processInfo();
+        let size = draft.size;
+        let cpu_values: Vec<u32> = (1..=(host.processorCount() as u32).max(size.cpus)).collect();
+        let memory_values = Resources::memory_choices((host.physicalMemory() >> 30) as u32, size.memory);
+        let disk_values = Resources::disk_choices(None);
+
+        let name = NSTextField::textFieldWithString(&ns(&draft.name), self.mtm);
+        name.setPlaceholderString(Some(&ns("letters, digits, - and _")));
+        activate(&[name.widthAnchor().constraintEqualToConstant(220.0)]);
+        let cpus = choice_popup(self.mtm, &cpu_values, "", size.cpus);
+        let memory = choice_popup(self.mtm, &memory_values, " GiB", size.memory);
+        let disk = choice_popup(self.mtm, &disk_values, " GiB", size.disk);
+        let kind = NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(self.mtm), NSRect::ZERO, false);
+        for vm in VM_KINDS {
+            kind.addItemWithTitle(&ns(vm.title));
+        }
+        kind.selectItemAtIndex(draft.kind as NSInteger);
+        let rosetta = checkbox(self.mtm, "Rosetta for x86 images (VZ only)", draft.rosetta);
+        let kubernetes = checkbox(self.mtm, "Kubernetes", draft.kubernetes);
+
+        let grid = NSGridView::gridViewWithNumberOfColumns_rows(2, 0, self.mtm);
+        grid.setRowSpacing(8.0);
+        grid.setColumnSpacing(10.0);
+        let add_row = |title: &str, view: &NSView| {
+            let key = label(self.mtm, title, 13.0, unsafe { NSFontWeightRegular });
+            let row: [&NSView; 2] = [&key, view];
+            grid.addRowWithViews(&NSArray::from_slice(&row));
+        };
+        add_row("Name", &name);
+        add_row("CPUs", &cpus);
+        add_row("Memory", &memory);
+        add_row("Disk", &disk);
+        add_row("Virtual machine", &kind);
+        if cfg!(target_arch = "aarch64") {
+            add_row("", &rosetta);
+        }
+        add_row("", &kubernetes);
+        grid.columnAtIndex(0).setXPlacement(NSGridCellPlacement::Trailing);
+        grid.setFrameSize(grid.fittingSize());
+
+        let detail = draft.problem.clone().unwrap_or_else(|| {
+            "A separate VM with its own Docker engine, images and volumes. Its VM type and mount cannot be \
+             changed later. Kubernetes takes more CPU and memory in the VM."
+                .to_string()
+        });
+        let alert = NSAlert::new(self.mtm);
+        alert.setMessageText(&ns("New Colima profile"));
+        alert.setInformativeText(&ns(&detail));
+        alert.addButtonWithTitle(&ns("Create and Start"));
+        alert.addButtonWithTitle(&ns("Cancel"));
+        alert.setAccessoryView(Some(&grid));
+        alert.window().setInitialFirstResponder(Some(&name));
+        let block = RcBlock::new(move |response: NSModalResponse| {
+            if response != NSAlertFirstButtonReturn {
+                return;
+            }
+            let pick = |popup: &NSPopUpButton, values: &[u32]| values.get(popup.indexOfSelectedItem() as usize).copied();
+            let picked = (pick(&cpus, &cpu_values), pick(&memory, &memory_values), pick(&disk, &disk_values));
+            let (Some(c), Some(m), Some(d)) = picked else { return };
+            let draft = NewProfile {
+                name: name.stringValue().to_string().trim().to_string(),
+                size: Resources { cpus: c, memory: m, disk: d },
+                kind: (kind.indexOfSelectedItem().max(0) as usize).min(VM_KINDS.len() - 1),
+                rosetta: cfg!(target_arch = "aarch64") && is_on(&rosetta),
+                kubernetes: is_on(&kubernetes),
+                problem: None,
+            };
+            with_ctl(|ctl| ctl.create_profile(draft));
+        });
+        alert.beginSheetModalForWindow_completionHandler(&self.window, Some(&block));
+    }
+
+    /// Switches to the new profile and starts its VM, with the output on the
+    /// Colima page as for any start. A bad name brings the sheet back.
+    fn create_profile(&self, draft: NewProfile) {
+        let problem = {
+            let st = self.st.borrow();
+            let existing = st.info.as_ref().map(|info| info.profiles.clone()).unwrap_or_default();
+            profile_name_problem(&draft.name, &existing)
+        };
+        if let Some(problem) = problem {
+            // After this sheet has gone, so the next one can attach.
+            after_main(Duration::ZERO, move || {
+                with_ctl(|ctl| ctl.ask_new_profile(NewProfile { problem: Some(problem), ..draft }));
+            });
+            return;
+        }
+        if self.st.borrow().op.is_some() {
+            return;
+        }
+        let change = ResourceChange::new_vm(draft.size, VM_KINDS[draft.kind], draft.rosetta, draft.kubernetes);
+        self.select_profile(&draft.name);
+        self.sidebar.select(Page::Colima);
+        self.colima_op(ColimaOp::Resize { change, restart: false });
     }
 
     // Containers, images and volumes
@@ -1130,7 +1470,7 @@ impl Controller {
             return self.compose_action(projects, verb);
         }
         let keys = self.selected_ids();
-        let targets: Vec<String> = {
+        let targets: Vec<(String, String)> = {
             let st = self.st.borrow();
             let applies = |c: &Container| match action {
                 ContainerAction::Start => !c.is_running(),
@@ -1140,23 +1480,62 @@ impl Controller {
                 ContainerAction::Unpause => c.state == "paused",
             };
             keys.into_iter()
-                .filter(|key| st.containers.iter().any(|c| c.id == *key && applies(c)))
+                .filter_map(|key| {
+                    let container = st.containers.iter().find(|c| c.id == key && applies(c))?;
+                    Some((container.name().to_string(), key))
+                })
                 .collect()
         };
         if targets.is_empty() {
             return;
         }
-        self.run_docker(move |docker| {
-            targets.iter().find_map(|id| docker.container_action(id, action).err())
-        });
+        self.run_each(targets, move |docker, id| docker.container_action(id, action));
     }
 
     /// Acts on whole projects through `docker compose`, which knows the order
     /// their services depend on.
     fn compose_action(&self, projects: Vec<String>, verb: &'static str) {
-        self.run_docker(move |docker| {
-            projects.iter().find_map(|project| compose(docker.socket(), project, &[verb]).err())
+        let items = projects.into_iter().map(|project| (project.clone(), project)).collect();
+        self.run_each(items, move |docker, project| compose(docker.socket(), project, &[verb]));
+    }
+
+    /// Asks for a project folder or a Compose file. Files of any type can be
+    /// picked; compose_up_args turns down the ones that are not YAML.
+    fn ask_compose_up(&self) {
+        let panel = NSOpenPanel::openPanel(self.mtm);
+        panel.setCanChooseDirectories(true);
+        panel.setCanChooseFiles(true);
+        panel.setAllowsMultipleSelection(false);
+        panel.setMessage(Some(&ns("Choose a project folder or a Compose file to start on Colima.")));
+        panel.setPrompt(Some(&ns("Compose Up")));
+        let chosen = panel.clone();
+        let block = RcBlock::new(move |response: NSModalResponse| {
+            // The panel may still be on screen, and an alert may follow.
+            chosen.orderOut(None);
+            let url = chosen.URLs().firstObject();
+            let path = url.and_then(|url| url.path()).map(|path| PathBuf::from(path.to_string()));
+            if let (true, Some(path)) = (response == NSModalResponseOK, path) {
+                with_ctl(|ctl| ctl.compose_up(path));
+            }
         });
+        panel.beginSheetModalForWindow_completionHandler(&self.window, &block);
+    }
+
+    fn compose_up(&self, path: PathBuf) {
+        if let Err(error) = compose_up_args(&path, path.is_dir()) {
+            return self.show_error("Not a Compose project", &error);
+        }
+        let home = env::var_os("HOME").map(PathBuf::from);
+        if home.is_some_and(|home| !shared_with_vm(&path, &home)) {
+            let detail = format!(
+                "{}\n\nColima shares only your home folder with its VM, so bind mounts from here come up empty.",
+                path.display()
+            );
+            return self.confirm("This project is outside your home folder", &detail, "Compose Up", move |ctl| {
+                ctl.run_docker(move |docker| compose_up(docker.socket(), &path).err());
+            });
+        }
+        self.run_docker(move |docker| compose_up(docker.socket(), &path).err());
     }
 
     /// Runs engine work off the main thread, tracked by the activity capsule.
@@ -1165,6 +1544,19 @@ impl Controller {
         self.render_chrome();
         let docker = self.docker();
         thread::spawn(move || post(Msg::ActionDone(work(&docker))));
+    }
+
+    /// Runs `work` on every item off the main thread and reports every failure at
+    /// the end, so one refusal does not leave the rest of a batch undone. Each
+    /// item is a name to show and the key to act on.
+    fn run_each(&self, items: Vec<(String, String)>, work: impl Fn(&Docker, &str) -> DResult<()> + Send + 'static) {
+        self.run_docker(move |docker| {
+            let failures: Vec<(String, String)> = items
+                .iter()
+                .filter_map(|(name, key)| work(docker, key).err().map(|error| (name.clone(), error)))
+                .collect();
+            pages::batch_error(items.len(), &failures)
+        });
     }
 
     fn confirm_remove(&self) {
@@ -1183,25 +1575,31 @@ impl Controller {
             return self.confirm(&title, &detail, "Remove", move |ctl| ctl.compose_action(projects, "down"));
         }
         let Some(table) = self.current_table() else { return };
-        let keys = if page == Page::Containers { self.selected_ids() } else { table.selected_keys() };
+        let keys = match page {
+            Page::Containers => self.selected_ids(),
+            Page::Networks => self.removable_networks(),
+            _ => table.selected_keys(),
+        };
         if keys.is_empty() {
             return;
         }
         let count = keys.len();
-        let names: Vec<String> = {
+        let items: Vec<(String, String)> = {
             let st = self.st.borrow();
             keys.iter()
-                .map(|key| match page {
-                    Page::Containers => st
-                        .containers
-                        .iter()
-                        .find(|c| c.id == *key)
-                        .map_or(key.clone(), |c| c.name().to_string()),
-                    _ => key.clone(),
+                .map(|key| {
+                    let name = match page {
+                        Page::Containers => {
+                            st.containers.iter().find(|c| c.id == *key).map_or(key.clone(), |c| c.name().to_string())
+                        }
+                        Page::Networks => st.networks.iter().find(|n| n.id == *key).map_or(key.clone(), |n| n.name.clone()),
+                        _ => key.clone(),
+                    };
+                    (name, key.clone())
                 })
-                .take(5)
                 .collect()
         };
+        let names: Vec<&str> = items.iter().map(|(name, _)| name.as_str()).take(5).collect();
         let any_running = {
             let st = self.st.borrow();
             page == Page::Containers
@@ -1210,6 +1608,7 @@ impl Controller {
         let noun = match page {
             Page::Containers => "container",
             Page::Images => "image",
+            Page::Networks => "network",
             _ => "volume",
         };
         let mut detail = names.join(", ");
@@ -1223,23 +1622,66 @@ impl Controller {
         }
         let title = if count == 1 { format!("Remove this {noun}?") } else { format!("Remove {count} {noun}s?") };
         self.confirm(&title, &detail, "Remove", move |ctl| {
-            ctl.run_docker(move |docker| {
-                keys.iter().find_map(|key| {
-                    match page {
-                        Page::Containers => docker.remove_container(key, true),
-                        Page::Images => docker.remove_image(key),
-                        _ => docker.remove_volume(key),
-                    }
-                    .err()
-                })
+            ctl.run_each(items, move |docker, key| match page {
+                Page::Containers => docker.remove_container(key, true),
+                Page::Images => docker.remove_image(key),
+                Page::Networks => docker.remove_network(key),
+                _ => docker.remove_volume(key),
             });
         });
     }
 
+    /// Asks the engine what would go before asking the user: the page may be
+    /// minutes old, and the prompt names everything about to be deleted.
     fn ask_prune(&self) {
-        let Some(line) = self.selected_storage_line() else { return };
-        let (title, detail) = pages::prune_prompt(&line);
-        self.confirm(&title, &detail, "Remove", move |ctl| ctl.prune(line.kind));
+        if self.st.borrow().page == Page::Networks {
+            return self.ask_prune_networks();
+        }
+        let Some(kind) = self.selected_storage_line().map(|line| line.kind) else { return };
+        let epoch = {
+            let mut st = self.st.borrow_mut();
+            st.busy_actions += 1;
+            st.epoch
+        };
+        self.render_chrome();
+        let docker = self.docker();
+        thread::spawn(move || post(Msg::PrunePreview(epoch, kind, docker.prune_preview(kind))));
+    }
+
+    fn prune_preview_arrived(&self, epoch: u64, kind: Prune, result: DResult<PrunePreview>) {
+        {
+            let mut st = self.st.borrow_mut();
+            st.busy_actions = st.busy_actions.saturating_sub(1);
+        }
+        self.render_chrome();
+        if !self.current(epoch) {
+            return;
+        }
+        match result.map(|preview| pages::prune_prompt(kind, &preview)) {
+            Ok(Some((title, detail))) => self.confirm(&title, &detail, "Remove", move |ctl| ctl.prune(kind)),
+            Ok(None) => {
+                let (title, detail) = pages::prune_nothing(kind);
+                self.show_notice(&title, &detail);
+            }
+            Err(error) => self.show_error("Could not check what would be removed", &error),
+        }
+    }
+
+    /// Removes the networks it names one by one, so nothing goes that the
+    /// confirmation did not list.
+    fn ask_prune_networks(&self) {
+        let (items, prompt) = {
+            let st = self.st.borrow();
+            let unused = pages::unused_networks(&st.networks, &st.containers);
+            let items: Vec<(String, String)> = unused.iter().map(|n| (n.name.clone(), n.id.clone())).collect();
+            (items, pages::network_prune_prompt(&unused))
+        };
+        if items.is_empty() {
+            return self.show_notice("Nothing to remove", "Every network has a container attached.");
+        }
+        self.confirm(&prompt.0, &prompt.1, "Remove", move |ctl| {
+            ctl.run_each(items, |docker, id| docker.remove_network(id));
+        });
     }
 
     fn prune(&self, kind: Prune) {
@@ -1374,7 +1816,7 @@ impl Controller {
                 });
             }
             SampleKind::Vm => {
-                let Some(colima) = self.colima.clone() else { return };
+                let Some(colima) = self.colima() else { return };
                 thread::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         if let Some((used, total)) = colima.vm_memory() {
@@ -1722,6 +2164,40 @@ fn choice_popup(mtm: MainThreadMarker, values: &[u32], unit: &str, selected: u32
     popup
 }
 
+/// What the New Profile sheet was filled in with, kept to bring it back when
+/// the name will not do.
+#[derive(Clone, Debug)]
+struct NewProfile {
+    name: String,
+    size: Resources,
+    /// Index into `VM_KINDS`.
+    kind: usize,
+    rosetta: bool,
+    kubernetes: bool,
+    problem: Option<String>,
+}
+
+impl Default for NewProfile {
+    fn default() -> Self {
+        Self { name: String::new(), size: Resources::DEFAULT, kind: 0, rosetta: false, kubernetes: false, problem: None }
+    }
+}
+
+fn saved_profile() -> String {
+    let saved = NSUserDefaults::standardUserDefaults().stringForKey(&ns(PROFILE_KEY));
+    saved.map(|name| name.to_string()).filter(|name| !name.is_empty()).unwrap_or_else(|| DEFAULT_PROFILE.to_string())
+}
+
+fn checkbox(mtm: MainThreadMarker, title: &str, on: bool) -> Retained<NSButton> {
+    let button = unsafe { NSButton::checkboxWithTitle_target_action(&ns(title), None, None, mtm) };
+    button.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
+    button
+}
+
+fn is_on(button: &NSButton) -> bool {
+    button.state() == NSControlStateValueOn
+}
+
 /// Bind mounts the Mac can open. Colima shares the home folder at the same
 /// path, so only sources inside it name the same place on both sides.
 fn host_mounts(container: &Container) -> Vec<(String, String)> {
@@ -1732,29 +2208,94 @@ fn host_mounts(container: &Container) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Lets the main thread steer the engine watcher.
+struct WatchControl {
+    /// The open event stream, so it can be ended from outside.
+    stream: Mutex<Option<Cancel>>,
+    /// Bumped whenever the engine to watch changes.
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+static WATCH: WatchControl =
+    WatchControl { stream: Mutex::new(None), generation: Mutex::new(0), changed: Condvar::new() };
+
+impl WatchControl {
+    fn generation(&self) -> u64 {
+        *self.generation.lock().unwrap()
+    }
+
+    /// Ends the open event stream, or the one still connecting, and the watcher
+    /// opens a fresh one.
+    fn interrupt(&self) {
+        if let Some(stream) = self.stream.lock().unwrap().as_ref() {
+            stream.cancel();
+        }
+    }
+
+    /// Makes the watcher start over: it drops its stream, cuts any pause short,
+    /// and announces whatever the engine socket now says, up or down.
+    fn restart(&self) {
+        *self.generation.lock().unwrap() += 1;
+        self.changed.notify_all();
+        self.interrupt();
+    }
+
+    /// Waits `period`, or less if a restart comes first.
+    fn pause(&self, period: Duration, seen: u64) {
+        let generation = self.generation.lock().unwrap();
+        let _ = self.changed.wait_timeout_while(generation, period, |now| *now == seen);
+    }
+}
+
+/// The pause before reopening the event stream, and the one to use next time.
+/// A stream that ran a while was healthy, so the pauses start over; streams that
+/// keep ending at once wait twice as long each time, up to a ceiling.
+fn retry_after(wait: Duration, lasted: Duration) -> (Duration, Duration) {
+    let wait = if lasted >= EVENTS_HEALTHY { EVENTS_RETRY } else { wait };
+    (wait, (wait * 2).min(EVENTS_RETRY_MAX))
+}
+
 /// Follows the engine: long-polls its event stream while it is up, and quietly
-/// retries the socket while it is not. Idle cost is one blocked read.
+/// retries the socket while it is not. Idle cost is one blocked read, plus a ping
+/// whenever the stream has been silent for a minute.
 fn spawn_watcher(docker: Arc<Mutex<Docker>>) {
     thread::spawn(move || {
-        let mut up = false;
+        let mut seen = WATCH.generation();
+        let mut up = None;
+        let mut wait = EVENTS_RETRY;
         loop {
-            let current = docker.lock().unwrap().clone();
-            if current.ping() {
-                if !up {
-                    up = true;
-                    post(Msg::Engine(true));
-                }
-                let _ = current.watch_events(&Cancel::new(), |scope| post(Msg::Changed(scope)));
-                thread::sleep(Duration::from_millis(300));
-                // Anything could have happened while the stream was down.
-                post(Msg::Changed(Scope::ALL));
-            } else {
-                if up {
-                    up = false;
-                    post(Msg::Engine(false));
-                }
-                thread::sleep(ENGINE_RETRY);
+            let generation = WATCH.generation();
+            if generation != seen {
+                (seen, up, wait) = (generation, None, EVENTS_RETRY);
             }
+            let current = docker.lock().unwrap().clone();
+            let answers = current.ping();
+            // After a restart the engine is announced either way, so the main
+            // thread hears about the one it now shows.
+            if up != Some(answers) {
+                up = Some(answers);
+                post(Msg::Engine(seen, answers));
+            }
+            if !answers {
+                WATCH.pause(ENGINE_RETRY, seen);
+                continue;
+            }
+            let cancel = Cancel::new();
+            *WATCH.stream.lock().unwrap() = Some(cancel.clone());
+            // A restart since the ping would otherwise go unnoticed until this
+            // stream ends; one from here on cancels it.
+            if WATCH.generation() != seen {
+                continue;
+            }
+            let opened = Instant::now();
+            let _ = current.watch_events(&cancel, || current.ping(), |scope| post(Msg::Changed(scope)));
+            *WATCH.stream.lock().unwrap() = None;
+            let (pause, next) = retry_after(wait, opened.elapsed());
+            wait = next;
+            WATCH.pause(pause, seen);
+            // Anything could have happened while the stream was down.
+            post(Msg::Changed(Scope::ALL));
         }
     });
 }
@@ -1824,5 +2365,23 @@ impl LogBuffer {
 
     fn take_behind(&self) -> bool {
         std::mem::take(&mut self.inner.lock().unwrap().behind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_stream_retries_back_off_and_start_over() {
+        let quick = Duration::from_millis(5);
+        assert_eq!(retry_after(EVENTS_RETRY, quick), (EVENTS_RETRY, EVENTS_RETRY * 2));
+        assert_eq!(retry_after(EVENTS_RETRY * 2, quick).0, EVENTS_RETRY * 2);
+        let mut wait = EVENTS_RETRY;
+        for _ in 0..20 {
+            wait = retry_after(wait, quick).1;
+        }
+        assert_eq!(wait, EVENTS_RETRY_MAX);
+        assert_eq!(retry_after(wait, EVENTS_HEALTHY), (EVENTS_RETRY, EVENTS_RETRY * 2));
     }
 }

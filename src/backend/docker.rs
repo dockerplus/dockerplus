@@ -8,6 +8,7 @@ use super::colima::{find_tool, search_path};
 use super::http::{self, Cancel, encode};
 use super::model::*;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -17,6 +18,9 @@ pub type DResult<T> = Result<T, String>;
 const QUICK: Duration = Duration::from_secs(15);
 /// Stopping waits for the container's own grace period, so allow well beyond it.
 const SLOW: Duration = Duration::from_secs(120);
+/// The event stream is silent while nothing changes. After this long without a
+/// word, the caller's check says whether the engine is still there.
+const EVENTS_IDLE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Docker {
@@ -32,9 +36,9 @@ pub enum ContainerAction {
     Unpause,
 }
 
-/// Requests made for the containers, images and volumes lists, for measuring.
+/// Requests made for the containers, images, volumes and networks lists, for measuring.
 #[cfg(feature = "devtools")]
-pub static FETCHES: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+pub static FETCHES: [std::sync::atomic::AtomicUsize; 4] = [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
 
 /// Which lists a refresh should fetch.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -42,18 +46,21 @@ pub struct Scope {
     pub containers: bool,
     pub images: bool,
     pub volumes: bool,
+    pub networks: bool,
 }
 
 impl Scope {
-    pub const ALL: Self = Self { containers: true, images: true, volumes: true };
-    pub const CONTAINERS: Self = Self { containers: true, images: false, volumes: false };
-    pub const IMAGES: Self = Self { containers: false, images: true, volumes: false };
-    pub const VOLUMES: Self = Self { containers: false, images: false, volumes: true };
+    pub const ALL: Self = Self { containers: true, images: true, volumes: true, networks: true };
+    pub const CONTAINERS: Self = Self { containers: true, images: false, volumes: false, networks: false };
+    pub const IMAGES: Self = Self { containers: false, images: true, volumes: false, networks: false };
+    pub const VOLUMES: Self = Self { containers: false, images: false, volumes: true, networks: false };
+    pub const NETWORKS: Self = Self { containers: false, images: false, volumes: false, networks: true };
 
     pub fn merge(&mut self, other: Self) {
         self.containers |= other.containers;
         self.images |= other.images;
         self.volumes |= other.volumes;
+        self.networks |= other.networks;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -63,16 +70,23 @@ impl Scope {
     /// The list an engine event touches. Image and volume "used by" columns come
     /// from the containers list, so container events need nothing else. Anything
     /// unreadable refreshes everything, since a stale list is worse than a fetch.
+    /// Connecting a network changes a container, which is where the network
+    /// page counts its containers.
     fn of_event(line: &str) -> Self {
         #[derive(serde::Deserialize)]
         struct Event {
             #[serde(rename = "Type")]
             kind: String,
+            #[serde(rename = "Action", default)]
+            action: String,
         }
-        match serde_json::from_str::<Event>(line).map(|event| event.kind).as_deref() {
-            Ok("container") => Self::CONTAINERS,
-            Ok("image") => Self::IMAGES,
-            Ok("volume") => Self::VOLUMES,
+        let event = serde_json::from_str::<Event>(line);
+        match event.as_ref().map(|event| (event.kind.as_str(), event.action.as_str())) {
+            Ok(("container", _)) => Self::CONTAINERS,
+            Ok(("image", _)) => Self::IMAGES,
+            Ok(("volume", _)) => Self::VOLUMES,
+            Ok(("network", "connect" | "disconnect")) => Self::CONTAINERS,
+            Ok(("network", _)) => Self::NETWORKS,
             _ => Self::ALL,
         }
     }
@@ -84,6 +98,7 @@ pub struct Snapshot {
     pub containers: Option<Vec<Container>>,
     pub images: Option<Vec<Image>>,
     pub volumes: Option<Vec<Volume>>,
+    pub networks: Option<Vec<Network>>,
     /// The lists that could not be fetched.
     pub failed: Scope,
 }
@@ -131,7 +146,7 @@ impl Docker {
     /// A list that fails costs only itself: the others still arrive.
     pub fn snapshot(&self, scope: Scope) -> Snapshot {
         #[cfg(feature = "devtools")]
-        for (count, fetched) in FETCHES.iter().zip([scope.containers, scope.images, scope.volumes]) {
+        for (count, fetched) in FETCHES.iter().zip([scope.containers, scope.images, scope.volumes, scope.networks]) {
             count.fetch_add(fetched as usize, std::sync::atomic::Ordering::Relaxed);
         }
         let mut snapshot = Snapshot::default();
@@ -144,6 +159,9 @@ impl Docker {
         if scope.volumes {
             let volumes = self.get_json::<VolumeList>("/volumes").map(|list| list.volumes);
             snapshot.volumes = snapshot.keep(Scope::VOLUMES, volumes);
+        }
+        if scope.networks {
+            snapshot.networks = snapshot.keep(Scope::NETWORKS, self.get_json("/networks"));
         }
         snapshot
     }
@@ -172,6 +190,18 @@ impl Docker {
         let body = self.call("POST", &path, SLOW)?;
         let report: Report = serde_json::from_slice(&body).map_err(|e| format!("Unexpected reply from {path}: {e}"))?;
         Ok(report.space_reclaimed)
+    }
+
+    /// What pruning `kind` would remove right now, for the confirmation. The
+    /// engine decides afresh when it prunes, so this shows, it does not promise.
+    pub fn prune_preview(&self, kind: Prune) -> DResult<PrunePreview> {
+        let only = match kind {
+            Prune::Containers => "container",
+            Prune::Images => "image",
+            Prune::Volumes => "volume",
+            Prune::BuildCache => "build-cache",
+        };
+        Ok(self.get_json::<DiskUsage>(&format!("/system/df?type={only}"))?.preview(kind))
     }
 
     /// One reading, returned at once. Without `one-shot` the engine spends two
@@ -218,6 +248,11 @@ impl Docker {
 
     pub fn remove_volume(&self, name: &str) -> DResult<()> {
         self.call("DELETE", &format!("/volumes/{}", encode(name)), SLOW).map(drop)
+    }
+
+    /// The engine refuses while a running container is attached.
+    pub fn remove_network(&self, id: &str) -> DResult<()> {
+        self.call("DELETE", &format!("/networks/{}", encode(id)), SLOW).map(drop)
     }
 
     /// Streams a container's logs. Follows until `cancel` fires or it exits.
@@ -298,21 +333,36 @@ impl Docker {
     }
 
     /// Blocks until the event stream ends, reporting which list each change
-    /// could alter.
-    pub fn watch_events(&self, cancel: &Cancel, mut on_event: impl FnMut(Scope)) -> DResult<()> {
+    /// could alter. An error reply ends it with that error rather than being
+    /// read as events. After a silent spell, `alive` decides whether to wait on.
+    pub fn watch_events(
+        &self,
+        cancel: &Cancel,
+        alive: impl FnMut() -> bool,
+        mut on_event: impl FnMut(Scope),
+    ) -> DResult<()> {
         // Health checks fire exec_* events constantly; they change nothing here.
         let filters = serde_json::json!({
-            "type": ["container", "image", "volume"],
+            "type": ["container", "image", "volume", "network"],
             "event": ["create", "destroy", "start", "stop", "die", "pause", "unpause",
-                      "rename", "pull", "delete", "tag", "untag", "load", "health_status"],
+                      "rename", "pull", "delete", "tag", "untag", "load", "health_status",
+                      "connect", "disconnect", "remove"],
         });
         let path = format!("/events?filters={}", encode(&filters.to_string()));
         let mut lines = LineSplitter::default();
-        http::stream(&self.sock, "GET", &path, cancel, |_, chunk| {
-            lines.feed(chunk, |line| on_event(Scope::of_event(line)));
+        let mut failure = Vec::new();
+        let status = http::stream_watched(&self.sock, "GET", &path, cancel, EVENTS_IDLE, alive, |status, chunk| {
+            if status >= 400 {
+                failure.extend_from_slice(chunk); // error bodies are not framed
+            } else {
+                lines.feed(chunk, |line| on_event(Scope::of_event(line)));
+            }
         })
-        .map(drop)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        if status >= 400 {
+            return Err(api_error(status, &failure));
+        }
+        Ok(())
     }
 }
 
@@ -332,11 +382,45 @@ fn api_error(status: u16, body: &[u8]) -> String {
 /// order and waiting for health checks. `DOCKER_HOST` binds it to Colima's socket
 /// whatever the active context is.
 pub fn compose(socket: &Path, project: &str, args: &[&str]) -> DResult<()> {
+    let mut all: Vec<OsString> = vec!["-p".into(), project.into()];
+    all.extend(args.iter().map(OsString::from));
+    run_compose(socket, &all)
+}
+
+/// Starts the project in a folder, or in one Compose file, as `docker compose
+/// up -d` would from a terminal there.
+pub fn compose_up(socket: &Path, path: &Path) -> DResult<()> {
+    run_compose(socket, &compose_up_args(path, path.is_dir())?)
+}
+
+/// The folder is the project directory, so `.env` and relative paths resolve
+/// as they do in a terminal; a chosen file is its folder plus `-f`.
+pub fn compose_up_args(path: &Path, is_dir: bool) -> DResult<Vec<OsString>> {
+    let mut args: Vec<OsString> = vec!["--project-directory".into()];
+    if is_dir {
+        args.push(path.into());
+    } else {
+        let yaml = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"));
+        let Some(folder) = path.parent().filter(|_| yaml) else {
+            return Err(format!("{} is not a Compose file. Choose a folder, or a .yml or .yaml file.", path.display()));
+        };
+        args.extend([folder.into(), "-f".into(), path.into()]);
+    }
+    args.extend(["up".into(), "-d".into()]);
+    Ok(args)
+}
+
+/// Colima shares only the home folder with its VM; bind mounts from anywhere
+/// else come up empty inside the containers.
+pub fn shared_with_vm(path: &Path, home: &Path) -> bool {
+    path.starts_with(home)
+}
+
+fn run_compose(socket: &Path, args: &[OsString]) -> DResult<()> {
     let Some(mut command) = compose_command(find_tool("docker"), find_tool("docker-compose")) else {
         return Err("Project actions need Docker Compose. Install it with: brew install docker docker-compose".to_string());
     };
     let output = command
-        .args(["-p", project])
         .args(args)
         .env("DOCKER_HOST", format!("unix://{}", socket.display()))
         .env("PATH", search_path())
@@ -382,7 +466,7 @@ pub fn exec_script(cli: &Path, socket: &Path, id: &str) -> String {
     )
 }
 
-fn shell_quote(text: &str) -> String {
+pub(crate) fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
@@ -513,6 +597,62 @@ mod tests {
         path.to_path_buf()
     }
 
+    /// An engine that answers each request with what `reply` returns for its path,
+    /// as status line and body, then closes the connection.
+    fn fake_engine(name: &str, reply: fn(&str) -> (&'static str, &'static str)) -> (PathBuf, PathBuf) {
+        let dir = scratch_dir(name);
+        let sock = dir.join("d.sock");
+        let _ = fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut request = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                reader.read_line(&mut request).unwrap();
+                while reader.read_line(&mut String::new()).is_ok_and(|n| n > 2) {}
+                let (status, body) = reply(request.split(' ').nth(1).unwrap_or(""));
+                let head = format!("HTTP/1.1 {status}\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body.as_bytes()));
+            }
+        });
+        (dir, sock)
+    }
+
+    #[test]
+    fn an_event_stream_error_is_an_error_not_events() {
+        let (dir, sock) = fake_engine("events-error", |_| ("500 Oops", r#"{"message":"events are off"}"#));
+        let mut events = 0;
+        let result = Docker::new(&sock).watch_events(&Cancel::new(), || true, |_| events += 1);
+        assert_eq!(result, Err("events are off".to_string()));
+        assert_eq!(events, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn events_report_the_lists_they_touch() {
+        let (dir, sock) = fake_engine("events", |_| {
+            ("200 OK", "{\"Type\":\"container\",\"Action\":\"start\"}\n{\"Type\":\"image\",\"Action\":\"pull\"}\n")
+        });
+        let mut scopes = Vec::new();
+        let result = Docker::new(&sock).watch_events(&Cancel::new(), || true, |scope| scopes.push(scope));
+        assert_eq!(result, Ok(()));
+        assert_eq!(scopes, [Scope::CONTAINERS, Scope::IMAGES]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prune_preview_asks_only_for_its_kind() {
+        let (dir, sock) = fake_engine("preview", |path| match path {
+            "/system/df?type=volume" => {
+                ("200 OK", r#"{"Volumes":[{"Name":"data","UsageData":{"RefCount":0,"Size":500}}],"VolumeUsage":{}}"#)
+            }
+            _ => ("404 Not Found", r#"{"message":"wrong path"}"#),
+        });
+        let preview = Docker::new(&sock).prune_preview(Prune::Volumes).unwrap();
+        assert_eq!(preview.items, [("data".to_string(), Some(500))]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_failed_list_does_not_cost_the_others() {
         let dir = scratch_dir("snapshot");
@@ -590,11 +730,13 @@ mod tests {
         assert_eq!(Scope::of_event(r#"{"Type":"container","Action":"start"}"#), Scope::CONTAINERS);
         assert_eq!(Scope::of_event(r#"{"Type":"image","Action":"pull"}"#), Scope::IMAGES);
         assert_eq!(Scope::of_event(r#"{"Type":"volume","Action":"create"}"#), Scope::VOLUMES);
+        assert_eq!(Scope::of_event(r#"{"Type":"network","Action":"destroy"}"#), Scope::NETWORKS);
+        assert_eq!(Scope::of_event(r#"{"Type":"network","Action":"connect"}"#), Scope::CONTAINERS);
     }
 
     #[test]
     fn anything_unreadable_refreshes_everything() {
-        assert_eq!(Scope::of_event(r#"{"Type":"network"}"#), Scope::ALL);
+        assert_eq!(Scope::of_event(r#"{"Type":"daemon"}"#), Scope::ALL);
         assert_eq!(Scope::of_event("not json"), Scope::ALL);
     }
 
@@ -604,7 +746,26 @@ mod tests {
         assert!(scope.is_empty());
         scope.merge(Scope::IMAGES);
         scope.merge(Scope::VOLUMES);
-        assert_eq!(scope, Scope { containers: false, images: true, volumes: true });
+        assert_eq!(scope, Scope { containers: false, images: true, volumes: true, networks: false });
+    }
+
+    #[test]
+    fn compose_up_runs_in_the_chosen_folder() {
+        let args = |path: &str, is_dir| compose_up_args(Path::new(path), is_dir).map(|a| a.join(std::ffi::OsStr::new(" ")));
+        assert_eq!(args("/Users/a/shop", true).unwrap(), "--project-directory /Users/a/shop up -d");
+        assert_eq!(
+            args("/Users/a/shop/compose.prod.YAML", false).unwrap(),
+            "--project-directory /Users/a/shop -f /Users/a/shop/compose.prod.YAML up -d"
+        );
+        assert!(args("/Users/a/shop/Dockerfile", false).unwrap_err().contains("not a Compose file"));
+    }
+
+    #[test]
+    fn only_the_home_folder_reaches_the_vm() {
+        let home = Path::new("/Users/a");
+        assert!(shared_with_vm(Path::new("/Users/a/shop"), home));
+        assert!(!shared_with_vm(Path::new("/Users/ab/shop"), home));
+        assert!(!shared_with_vm(Path::new("/Volumes/Work/shop"), home));
     }
 
     #[test]

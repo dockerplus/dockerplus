@@ -5,8 +5,23 @@
 #   dockerplus ps
 #   dockerplus compose up -d
 
+# Colima's own COLIMA_PROFILE first, then the profile picked in the app. An
+# unreadable or odd setting from the app is ignored rather than trusted as a path.
+profile=${COLIMA_PROFILE:-}
+if [ -z "$profile" ]; then
+    profile=$(defaults read local.dockerplus.app DPColimaProfile 2>/dev/null) || profile=
+    case "$profile" in
+        *[!A-Za-z0-9_-]* | -*) profile= ;;
+    esac
+fi
+# Named the way Colima names them (ProfileFromName in its config/profile.go).
+case "$profile" in
+    "" | colima) profile=default ;;
+    colima-*) profile=${profile#colima-} ;;
+esac
+
 # The same path as Colima::default_socket in src/backend/colima.rs.
-socket="${COLIMA_HOME:-$HOME/.colima}/default/docker.sock"
+socket="${COLIMA_HOME:-$HOME/.colima}/$profile/docker.sock"
 tool=docker
 
 refuse() {
@@ -75,7 +90,11 @@ esac
 # Not fatal: `dockerplus --version` works without an engine, and for everything
 # else docker reports the failed connection itself.
 if [ ! -S "$socket" ]; then
-    echo "dockerplus: Colima is not running. Start it in DockerPlus." >&2
+    if [ "$profile" = default ]; then
+        echo "dockerplus: Colima is not running. Start it in DockerPlus." >&2
+    else
+        echo "dockerplus: Colima profile $profile is not running. Start it in DockerPlus." >&2
+    fi
 fi
 
 # TLS settings meant for another engine would break the local socket.
