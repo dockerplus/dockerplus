@@ -2,100 +2,56 @@
 
 ![DockerPlus](assets/brand/rex/brand-sheet.png)
 
-A native macOS app for [Colima](https://github.com/abiosoft/colima) and its Docker
-engine. Written in Rust on AppKit, with real Liquid Glass. No webview, no background
-runtime.
-
-Requires macOS 26 or later.
+A native macOS app for [Colima](https://github.com/abiosoft/colima) and its Docker engine.
+Rust on AppKit with real Liquid Glass. No webview, no background runtime. macOS 26+.
 
 ## Features
 
-- **Colima:** VM status and settings; start, stop and restart with live output;
-  change CPUs, memory and disk. Memory stops 4 GiB short of the Mac's total, and disks
-  only grow.
-- **Containers:** list, start, stop, restart, pause, resume, remove; follow logs;
-  details with image digest, command, ports, mounts and networks.
-- From a container's context menu: open a shell in Terminal, open a published port
-  in the browser, show a bind mount in Finder, or select its whole Compose project
-  (this clears any filter hiding part of it).
-- **Images:** list by tag, pull, remove.
-- **Volumes:** list with size and the containers using them; remove.
-- Filter, sort and multi-select in every table. Show only running containers.
-- Updates live from Docker events.
+- **Colima:** start, stop, restart; change CPUs, memory and disk.
+- **Containers:** start, stop, restart, pause, remove; live logs; details.
+- **Context menu:** shell in Terminal, open a port in the browser, show a bind mount in
+  Finder, select a whole Compose project.
+- **Images and volumes:** pull, remove, see sizes and which containers use them.
+- Filter, sort and multi-select everywhere. Updates live from Docker events.
 
-Shortcuts: `⌘1`–`⌘4` switch pages, `⌘F` filter, `⌘L` logs, `⌘I` details, `⌘R` refresh.
+Shortcuts: `⌘1`–`⌘4` pages, `⌘F` filter, `⌘L` logs, `⌘I` details, `⌘R` refresh.
 
-Closing the window quits the app. Colima keeps running.
+## Install
 
-Open in Terminal needs the Docker CLI (`brew install docker`). Show in Finder lists bind
-mounts inside your home folder, which Colima shares at the same path.
-
-## Build and run
-
-You need Rust, the Xcode Command Line Tools and Colima (`brew install colima`).
+Needs Rust, the Xcode Command Line Tools and Colima.
 
 ```bash
+brew install colima
 scripts/bundle.sh
 open target/DockerPlus.app
 ```
 
-To install, copy `target/DockerPlus.app` to `/Applications`. The app is ad-hoc signed
-and not notarized, so it is meant for the machine that built it.
+The app is ad-hoc signed and not notarized, so it is meant for the Mac that built it.
+Open in Terminal also needs the Docker CLI (`brew install docker`).
 
-Run the tests with `cargo test`.
+## Safe next to Docker Desktop and OrbStack
 
-## Other Docker installs are left alone
+DockerPlus talks only to Colima's socket and starts Colima with `--activate=false`, so
+your current Docker context never changes. Run `docker context use colima` to switch.
 
-- DockerPlus talks only to Colima's socket (`~/.colima/default/docker.sock`) and never
-  reads `docker context`, so Docker Desktop and OrbStack are out of reach.
-- It always starts Colima with `--activate=false`, so your active Docker context does
-  not change. Colima saves this as `autoActivate: false` in
-  `~/.colima/default/colima.yaml`, which also applies when you run `colima start` by
-  hand. To make Colima the default, run `docker context use colima`.
+## Notes
 
-## macOS user names that clash with Ubuntu
+- Closing the window quits the app. Colima keeps running.
+- If your macOS user name is also an Ubuntu system account (`man`, `mail`…), DockerPlus
+  writes `~/.colima/_lima/_config/override.yaml` so `colima start` does not hang.
 
-If your macOS user name is also a system account in Ubuntu (`man`, `mail`, `games`…),
-`colima start` hangs for about 10 minutes and then fails with `did not receive an
-event with the running status`. Before starting Colima, DockerPlus writes
-`~/.colima/_lima/_config/override.yaml` so the VM user is `colima`. It never
-overwrites an existing file.
-
-## Project layout
-
-```text
-src/backend/   Docker Engine API over a Unix socket and the colima CLI; no AppKit, unit-tested
-src/ui/        AppKit views via objc2; main thread only
-src/rex.rs     T-rex mascot geometry, shared by the icon, SVGs and in-app glyphs
-src/mark.rs    Path helpers and the earlier truck logo
-examples/      make_brand regenerates the brand assets
-```
-
-Brand guide: [assets/brand/rex/BRAND.md](assets/brand/rex/BRAND.md).
-
-## UI testing
-
-A build with `--features devtools` opens a control socket that drives the real UI
-(`state`, `page containers`, `do ContainerStop`, `key cmd+2`, `clickrow <name>`,
-`snapshot <path>`, …). Default builds do not include it. The window must be active for
-synthetic clicks, because macOS ignores the first click on an inactive window: send
-`front` first.
+## Development
 
 ```bash
-scripts/bundle.sh --features devtools
-open --env DOCKERPLUS_DEV_SOCK="$PWD/target/dp.sock" target/DockerPlus.app
+cargo test
+scripts/bundle.sh --features devtools   # adds a socket that drives the UI in tests
 ```
+
+`src/backend/` holds the Docker API and Colima CLI code, `src/ui/` the AppKit views.
+Brand guide: [assets/brand/rex/BRAND.md](assets/brand/rex/BRAND.md).
 
 ## Status
 
-Version 0.1, tested on an M1 Pro MacBook Pro with macOS 27.2, Colima 0.10.3 and Docker
-Engine 29.5.2.
-
-- Shortcuts, clicks, double-clicks and sorting are tested with synthetic events sent
-  through `NSApp sendEvent:`, which covers menus, hit testing and click counting.
-- Not tested yet: a physical mouse and keyboard, the open context menu itself,
-  macOS 26.x, Reduce Transparency and Increase Contrast.
-- Not supported yet: Colima profiles other than `default`, Compose up and down,
-  networks, per-container stats, signing and notarization.
-- The log panel shows at most about 5 MB/s. A container that logs faster than that
-  stays live: the panel skips ahead to the latest lines and says so.
+Version 0.1, tested on macOS 27.2, Colima 0.10.3 and Docker Engine 29.5.2. Not yet
+supported: Colima profiles other than `default`, Compose up and down, networks,
+per-container stats, notarization.
